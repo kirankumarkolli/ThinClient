@@ -118,8 +118,12 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
         [Benchmark]
         public async Task<int> ReadItemStream()
         {
-            int i = this.cursor;
-            this.cursor = (i + 1) & (PkPoolSize - 1); // pool size is 1024, a power of two
+            // Atomic increment + mask: even though BDN serializes async iterations and any
+            // subsequent iteration sees this write through the await happens-before edge,
+            // making the read-modify-write atomic encodes that contract explicitly so a
+            // future change to BDN's iteration model can't silently make pool sampling
+            // non-deterministic.
+            int i = (System.Threading.Interlocked.Increment(ref this.cursor) - 1) & (PkPoolSize - 1);
             using ResponseMessage response = await this.container.ReadItemStreamAsync(
                 CannedOkDocumentId, new Cosmos.PartitionKey(this.pkPool[i]));
             return (int)response.StatusCode;
