@@ -162,3 +162,55 @@ routing-map call.
   to MultiHash / V1 hash / hierarchical partition keys reuses the same
   `ReadOnlySpan<byte>` contract since variable-length byte sequences fit the
   shape naturally.
+
+
+## Results - Raw-DSR scenario (DocumentClient.ProcessRequestAsync, hand-built DSR)
+
+Bench: DirectModeRoutingRawDsrBenchmark.ReadViaRawDsr - bypasses every public
+SDK abstraction (Container, ItemRequestOptions, ResponseMessage, the
+Cosmos.PartitionKey wrapper, retry policies, diagnostics) and drives the read
+by hand-constructing a DocumentServiceRequest and calling
+DocumentClient.ProcessRequestAsync directly. The partition-key value is
+published exclusively via the x-ms-documentdb-partitionkey header, so the
+JSON-PK / producer-bypass branch of AddressResolver is what's exercised.
+
+Same mocks, PK pool, PKRange topology and InvocationCount=25994 as
+DirectModeRoutingBenchmark. Variant selected via COSMOS_PKRANGE_VARIANT;
+producer-side string-EPK bypass via COSMOS_PKRANGE_BYPASS_STRING_EPK=true.
+
+| Id | Variant                       | Bypass | Mean (us) | StdDev (us) | P100 (us) | Gen0   | Allocated (KB) |
+|----|-------------------------------|--------|-----------|-------------|-----------|--------|----------------|
+| A  | string                        | off    | 11.14     | 0.721       | 12.99     | 4.5780 | 18.80          |
+| B  | uint128                       | off    | 11.00     | 0.751       | 12.73     | 4.5780 | 18.80          |
+| C  | bytespan-seq                  | off    | 10.87     | 0.578       | 12.67     | 4.5780 | 18.80          |
+| D  | bytespan-hand                 | off    | 10.53     | 0.357       | 11.24     | 4.5780 | 18.80          |
+| E  | uint128 + producer-bypass     | on     | 11.20     | 0.369       | 12.26     | 4.5010 | 18.53          |
+| F  | bytespan-hand + producer-bypass| on    | 11.05     | 0.323       | 11.71     | 4.5010 | 18.53          |
+
+### Cross-scenario comparison (Mean / Allocated)
+
+| Variant                         | DirectModeRoutingBenchmark (Container) | DirectModeRoutingRawDsrBenchmark (raw DSR) |
+|---------------------------------|----------------------------------------|--------------------------------------------|
+| A - string                      | ~16.0 us / 27.07 KB                    | 11.14 us / 18.80 KB                        |
+| B - uint128                     | ~15.9 us / 27.07 KB                    | 11.00 us / 18.80 KB                        |
+| C - bytespan-seq                | ~16.0 us / 27.07 KB                    | 10.87 us / 18.80 KB                        |
+| D - bytespan-hand               | ~15.9 us / 27.07 KB                    | 10.53 us / 18.80 KB                        |
+| E - uint128 + bypass            | ~15.9 us / 26.34 KB                    | 11.20 us / 18.53 KB                        |
+| F - bytespan-hand + bypass      | 15.82 us / 26.34 KB                    | 11.05 us / 18.53 KB                        |
+
+### Notes
+
+- The internal scenario shaves ~5 us of Mean and ~8 KB of allocations off every
+  point-read by skipping the Container -> ClientContextCore ->
+  RequestInvokerHandler -> diagnostics / retry / response-message stack.
+  That's the realistic floor for callers that already own those concerns.
+- The producer-side string-EPK bypass keeps its ~270 B/op allocation drop
+  (18.80 KB -> 18.53 KB, Gen0 4.5780 -> 4.5010) on this lower-level path, which
+  is exactly what's expected: the bypass removes the EPK string + yte[16]
+  allocations from the routing-map lookup, and those allocations are independent
+  of which outer layer drives the read.
+- All four routing-map variants (string / uint128 / bytespan-seq /
+  bytespan-hand) cluster within ~0.7 us at the Mean on this scenario, again
+  inside run-to-run noise. As with the Container-path benchmark, the visible
+  Mean win comes overwhelmingly from Phase 1a (zero-allocation string lookup),
+  not from any specific numeric fast-path representation.
