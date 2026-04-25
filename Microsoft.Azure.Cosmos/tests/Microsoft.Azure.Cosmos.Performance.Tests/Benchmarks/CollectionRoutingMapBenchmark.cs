@@ -10,6 +10,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
     using Microsoft.Azure.Cosmos.Routing;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Routing;
+    using UInt128 = Microsoft.Azure.Documents.UInt128;
 
     /// <summary>
     /// Benchmarks for <see cref="CollectionRoutingMap"/> point lookup operations.
