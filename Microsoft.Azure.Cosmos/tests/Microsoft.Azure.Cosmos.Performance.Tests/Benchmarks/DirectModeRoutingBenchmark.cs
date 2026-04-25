@@ -13,7 +13,6 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
     using Microsoft.Azure.Cosmos.Performance.Tests.Data;
     using Microsoft.Azure.Cosmos.Performance.Tests.Mocks;
     using Microsoft.Azure.Documents;
-
     /// <summary>
     /// End-to-end Direct-mode point-read benchmark that exercises the real production SDK
     /// from <see cref="Container.ReadItemStreamAsync(string, Cosmos.PartitionKey, ItemRequestOptions, System.Threading.CancellationToken)"/>
@@ -27,7 +26,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
     /// measured iteration performs no I/O — only in-process routing, serialization, and
     /// SDK bookkeeping.
     /// </summary>
-    [MemoryDiagnoser]
+    [Config(typeof(DirectModeRoutingBenchmarkConfig))]
     public class DirectModeRoutingBenchmark
     {
         private const string AccountName = "bench";
