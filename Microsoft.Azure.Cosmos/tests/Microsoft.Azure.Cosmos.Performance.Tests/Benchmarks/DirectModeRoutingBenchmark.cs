@@ -46,7 +46,6 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
         private PkRangeMetadataHandler handler;
         private DirectStubTransport transport;
         private string[] pkPool;
-        private int cursor;
 
         [GlobalSetup]
         public void GlobalSetup()
@@ -96,19 +95,15 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
         }
 
         /// <summary>
-        /// One point-read per iteration, cycling through the deterministic PK pool so the
-        /// routing-map lookup sees varied effective partition keys (not a single hot PKR).
+        /// One point-read per iteration, picking a uniformly-random partition key from the
+        /// deterministic PK pool so the routing-map lookup sees varied effective partition
+        /// keys (not a single hot PKR) without a shared cross-iteration counter.
         /// Returns a status code to prevent the JIT from eliding the call.
         /// </summary>
         [Benchmark]
         public async Task<int> ReadItemStream()
         {
-            // Atomic increment + mask: even though BDN serializes async iterations and any
-            // subsequent iteration sees this write through the await happens-before edge,
-            // making the read-modify-write atomic encodes that contract explicitly so a
-            // future change to BDN's iteration model can't silently make pool sampling
-            // non-deterministic.
-            int i = (System.Threading.Interlocked.Increment(ref this.cursor) - 1) & (PkPoolSize - 1);
+            int i = Random.Shared.Next(this.pkPool.Length);
             using ResponseMessage response = await this.container.ReadItemStreamAsync(
                 CannedOkDocumentId, new Cosmos.PartitionKey(this.pkPool[i]));
             return (int)response.StatusCode;

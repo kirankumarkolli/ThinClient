@@ -10,4 +10,4 @@ Unknown processor
 ```
 |         Method |     Mean |    Error |   StdDev |   Gen0 | Allocated |
 |--------------- |---------:|---------:|---------:|-------:|----------:|
-| ReadItemStream | 19.90 us | 0.784 us | 2.173 us | 6.3477 |  26.73 KB |
+| ReadItemStream | 23.03 us | 1.387 us | 4.023 us | 6.3477 |  26.85 KB |
