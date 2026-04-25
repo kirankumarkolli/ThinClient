@@ -679,6 +679,7 @@ namespace Microsoft.Azure.Cosmos.Tests
                     FastPathVariant.BytespanSeq,
                     FastPathVariant.BytespanHand,
                     FastPathVariant.Soa,
+                    FastPathVariant.StringSoa,
                 })
                 {
                     FastPathVariantSelector.ActiveVariant = variant;
@@ -753,6 +754,128 @@ namespace Microsoft.Azure.Cosmos.Tests
                     $"  min = {minHex}\n  max = {maxHex}\n" +
                     $"  string = [{string.Join(",", stringIds)}]\n  bytes  = [{string.Join(",", bytesIds)}]");
             }
+            }
+            finally
+            {
+                FastPathVariantSelector.ActiveVariant = savedVariant;
+            }
+        }
+
+        [TestMethod]
+        public void TestGetOverlappingRangesByStrings_MatchesStringPath()
+        {
+            const int rangeCount = 64;
+            FastPathVariant savedVariant = FastPathVariantSelector.ActiveVariant;
+            try
+            {
+                FastPathVariantSelector.ActiveVariant = FastPathVariant.StringSoa;
+                CollectionRoutingMap routingMap = BuildV2HashRoutingMap(rangeCount, seed: 0xD0E1);
+
+            const int sampleCount = 100;
+            Random rng = new Random(0xD0E2);
+            for (int s = 0; s < sampleCount; s++)
+            {
+                byte[] minBytes = new byte[16];
+                byte[] maxBytes = new byte[16];
+                rng.NextBytes(minBytes);
+                rng.NextBytes(maxBytes);
+                if (minBytes[0] == 0xFF) minBytes[0] = 0xFE;
+                if (maxBytes[0] == 0xFF) maxBytes[0] = 0xFE;
+                if (CompareBE(minBytes, maxBytes) > 0)
+                {
+                    byte[] tmp = minBytes; minBytes = maxBytes; maxBytes = tmp;
+                }
+                else if (CompareBE(minBytes, maxBytes) == 0)
+                {
+                    maxBytes[15] = (byte)(maxBytes[15] ^ 0x01);
+                    if (CompareBE(minBytes, maxBytes) > 0)
+                    {
+                        byte[] tmp = minBytes; minBytes = maxBytes; maxBytes = tmp;
+                    }
+                }
+
+                string minHex = ToHex32(minBytes);
+                string maxHex = ToHex32(maxBytes);
+
+                IReadOnlyList<PartitionKeyRange> stringResult =
+                    routingMap.GetOverlappingRanges(new Range<string>(minHex, maxHex, isMinInclusive: true, isMaxInclusive: false));
+                IReadOnlyList<PartitionKeyRange> soaResult =
+                    routingMap.GetOverlappingRangesByStrings(minHex, maxHex);
+
+                HashSet<string> stringIds = new HashSet<string>(stringResult.Select(r => r.Id));
+                HashSet<string> soaIds = new HashSet<string>(soaResult.Select(r => r.Id));
+                CollectionAssert.AreEquivalent(
+                    stringIds.ToList(),
+                    soaIds.ToList(),
+                    $"Sample {s}: GetOverlappingRangesByStrings diverged from GetOverlappingRanges.\n" +
+                    $"  min = {minHex}\n  max = {maxHex}\n" +
+                    $"  string = [{string.Join(",", stringIds)}]\n  soa    = [{string.Join(",", soaIds)}]");
+            }
+            }
+            finally
+            {
+                FastPathVariantSelector.ActiveVariant = savedVariant;
+            }
+        }
+
+        [TestMethod]
+        public void TestGetOverlappingRangesByStrings_OnV1HashTopology()
+        {
+            // V1-hash topology: 10-char zero-padded hex Min boundaries. The byte SoA path
+            // (GetOverlappingRangesByBytes) does not work here because hasNumericFastPath
+            // is false; the string SoA path must.
+            const int rangeCount = 16;
+            string[] boundaries = new string[rangeCount - 1];
+            uint step = (uint)(uint.MaxValue / rangeCount);
+            for (int i = 0; i < rangeCount - 1; i++)
+            {
+                ulong b = (ulong)(i + 1) * step;
+                boundaries[i] = b.ToString("X10");
+            }
+            Array.Sort(boundaries, StringComparer.Ordinal);
+
+            List<Tuple<PartitionKeyRange, ServiceIdentity>> ranges =
+                new List<Tuple<PartitionKeyRange, ServiceIdentity>>(rangeCount);
+            for (int i = 0; i < rangeCount; i++)
+            {
+                string min = i == 0 ? string.Empty : boundaries[i - 1];
+                string max = i == rangeCount - 1 ? "FF" : boundaries[i];
+                ranges.Add(Tuple.Create(
+                    new PartitionKeyRange { Id = i.ToString(), MinInclusive = min, MaxExclusive = max },
+                    (ServiceIdentity)null));
+            }
+
+            FastPathVariant savedVariant = FastPathVariantSelector.ActiveVariant;
+            try
+            {
+                FastPathVariantSelector.ActiveVariant = FastPathVariant.StringSoa;
+                CollectionRoutingMap routingMap = CollectionRoutingMap.TryCreateCompleteRoutingMap(
+                    ranges, string.Empty, false);
+                Assert.IsNotNull(routingMap);
+
+                // 50 random sub-ranges in 10-char hex.
+                Random rng = new Random(0xC0DE);
+                for (int s = 0; s < 50; s++)
+                {
+                    ulong a = (uint)rng.Next(0, int.MaxValue);
+                    ulong b = (uint)rng.Next(0, int.MaxValue);
+                    if (a == b) continue;
+                    if (a > b) { ulong tmp = a; a = b; b = tmp; }
+                    string minHex = a.ToString("X10");
+                    string maxHex = b.ToString("X10");
+
+                    IReadOnlyList<PartitionKeyRange> stringResult =
+                        routingMap.GetOverlappingRanges(new Range<string>(minHex, maxHex, isMinInclusive: true, isMaxInclusive: false));
+                    IReadOnlyList<PartitionKeyRange> soaResult =
+                        routingMap.GetOverlappingRangesByStrings(minHex, maxHex);
+
+                    HashSet<string> stringIds = new HashSet<string>(stringResult.Select(r => r.Id));
+                    HashSet<string> soaIds = new HashSet<string>(soaResult.Select(r => r.Id));
+                    CollectionAssert.AreEquivalent(
+                        stringIds.ToList(),
+                        soaIds.ToList(),
+                        $"V1 sample {s}: GetOverlappingRangesByStrings diverged on min={minHex}, max={maxHex}.");
+                }
             }
             finally
             {
@@ -849,6 +972,7 @@ namespace Microsoft.Azure.Cosmos.Tests
                     FastPathVariant.BytespanSeq,
                     FastPathVariant.BytespanHand,
                     FastPathVariant.Soa,
+                    FastPathVariant.StringSoa,
                 })
                 {
                     FastPathVariantSelector.ActiveVariant = variant;
@@ -957,6 +1081,89 @@ namespace Microsoft.Azure.Cosmos.Tests
             if (c >= 'a' && c <= 'f') return c - 'a' + 10;
             if (c >= 'A' && c <= 'F') return c - 'A' + 10;
             return 0;
+        }
+
+        /// <summary>
+        /// Variant H (StringSoa) targets V1 hash / hierarchical PK / variable-length-EPK
+        /// collections that cannot use the V2 byte fast path (variant G). This test builds
+        /// a V1-style routing map whose Min boundaries are 10-character zero-padded hex
+        /// (the same shape used elsewhere in this file's TryCombine fixtures), drives 1,000
+        /// random 10-char-hex EPKs through both the baseline string variant and
+        /// StringSoa, and asserts they resolve to identical PartitionKeyRange ids on every
+        /// sample. Confirms the SoA payload arrays are populated even when
+        /// <c>hasNumericFastPath</c> is false (i.e. the unconditional payload-SoA build).
+        /// </summary>
+        [TestMethod]
+        public void TestStringSoa_OnV1HashTopology_MatchesStringBaseline()
+        {
+            // Build a 16-range V1-style map: 10-char zero-padded hex boundaries spaced
+            // evenly across the V1 numeric space [0, 2^32). Pure string-keyed ordering.
+            const int rangeCount = 16;
+            string[] boundaries = new string[rangeCount - 1];
+            uint step = (uint)(uint.MaxValue / rangeCount);
+            for (int i = 0; i < rangeCount - 1; i++)
+            {
+                ulong b = (ulong)(i + 1) * step;
+                boundaries[i] = b.ToString("X10");
+            }
+            Array.Sort(boundaries, StringComparer.Ordinal);
+
+            List<Tuple<PartitionKeyRange, ServiceIdentity>> ranges =
+                new List<Tuple<PartitionKeyRange, ServiceIdentity>>(rangeCount);
+            for (int i = 0; i < rangeCount; i++)
+            {
+                string min = i == 0 ? string.Empty : boundaries[i - 1];
+                string max = i == rangeCount - 1 ? "FF" : boundaries[i];
+                ranges.Add(Tuple.Create(
+                    new PartitionKeyRange { Id = i.ToString(), MinInclusive = min, MaxExclusive = max },
+                    (ServiceIdentity)null));
+            }
+
+            CollectionRoutingMap.TryCreateCompleteRoutingMap(
+                ranges, string.Empty, false);
+
+            // Generate 1,000 random 10-char hex EPKs strictly less than "FF" (so they
+            // fall inside the addressable V1 space). Cap leading nibble to ensure the
+            // string sorts before "FF" under ordinal compare.
+            Random rng = new Random(0xD1AD);
+            const int sampleCount = 1_000;
+            string[] epks = new string[sampleCount];
+            for (int i = 0; i < sampleCount; i++)
+            {
+                ulong v = (uint)rng.Next(0, int.MaxValue);
+                epks[i] = v.ToString("X10");
+            }
+
+            FastPathVariant savedVariant = FastPathVariantSelector.ActiveVariant;
+            try
+            {
+                // Variant is fixed at construction time, so build a map per variant.
+                FastPathVariantSelector.ActiveVariant = FastPathVariant.String;
+                CollectionRoutingMap baselineMap = CollectionRoutingMap.TryCreateCompleteRoutingMap(
+                    ranges, string.Empty, false);
+                Assert.IsNotNull(baselineMap);
+                string[] baseline = epks.Select(e => baselineMap.GetRangeByEffectivePartitionKey(e).Id).ToArray();
+
+                FastPathVariantSelector.ActiveVariant = FastPathVariant.StringSoa;
+                CollectionRoutingMap stringSoaMap = CollectionRoutingMap.TryCreateCompleteRoutingMap(
+                    ranges, string.Empty, false);
+                Assert.IsNotNull(stringSoaMap);
+                string[] hits = epks.Select(e => stringSoaMap.GetRangeByEffectivePartitionKey(e).Id).ToArray();
+
+                for (int i = 0; i < sampleCount; i++)
+                {
+                    if (hits[i] != baseline[i])
+                    {
+                        Assert.Fail(
+                            $"StringSoa diverged from String on V1-hash sample {i} epk={epks[i]}: " +
+                            $"got id={hits[i]}, expected id={baseline[i]}.");
+                    }
+                }
+            }
+            finally
+            {
+                FastPathVariantSelector.ActiveVariant = savedVariant;
+            }
         }
 
         private static CollectionRoutingMap BuildV2HashRoutingMap(int rangeCount, int seed)

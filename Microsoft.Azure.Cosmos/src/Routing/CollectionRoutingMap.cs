@@ -216,6 +216,25 @@ namespace Microsoft.Azure.Cosmos.Routing
                 "Set COSMOS_PKRANGE_VARIANT=soa.");
         }
 
+        /// <summary>
+        /// Range query over string Min boundaries, valid only when the active fast-path
+        /// strategy is <see cref="StringSoaStrategy"/>. Works on any topology
+        /// (V1 hash, V2 hash, hierarchical PK, variable-length EPKs).
+        /// </summary>
+        public IReadOnlyList<PartitionKeyRange> GetOverlappingRangesByStrings(
+            string minInclusive,
+            string maxExclusive)
+        {
+            if (this.fastPathStrategy is StringSoaStrategy stringSoa)
+            {
+                return stringSoa.GetOverlappingRangesByStrings(minInclusive, maxExclusive);
+            }
+
+            throw new InvalidOperationException(
+                "GetOverlappingRangesByStrings requires the StringSoa fast-path strategy. " +
+                "Set COSMOS_PKRANGE_VARIANT=string-soa.");
+        }
+
         public PartitionKeyRange GetRangeByEffectivePartitionKey(string effectivePartitionKeyValue) =>
             this.fastPathStrategy.Resolve(effectivePartitionKeyValue);
 

@@ -41,6 +41,9 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
 
         /// <summary>Bytespan + payload SoA + branchless binary search.</summary>
         Soa,
+
+        /// <summary>String binary search + payload SoA + branchless string binary search. Works on any topology (V1/V2/hierarchical).</summary>
+        StringSoa,
     }
 
     /// <summary>
@@ -79,6 +82,7 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
                 case "radix2": return FastPathVariant.Radix2;
                 case "cache-last": return FastPathVariant.CacheLast;
                 case "soa": return FastPathVariant.Soa;
+                case "string-soa": return FastPathVariant.StringSoa;
                 default: return FastPathVariant.UInt128;
             }
         }

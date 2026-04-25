@@ -46,8 +46,13 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
         {
             if (!hasNumericFastPath)
             {
-                // Only StringStrategy is valid for non-V2-hash maps; all numeric strategies
-                // require 32-char hex boundaries.
+                // Numeric strategies require 32-char hex boundaries. StringSoa works on any
+                // topology so it's allowed through; everything else falls back to StringStrategy.
+                if (variant == FastPathVariant.StringSoa)
+                {
+                    return new StringSoaStrategy(orderedRanges);
+                }
+
                 return new StringStrategy(orderedRanges);
             }
 
@@ -67,6 +72,8 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
                     return new Radix2Strategy(orderedRanges);
                 case FastPathVariant.Soa:
                     return new SoaStrategy(orderedRanges);
+                case FastPathVariant.StringSoa:
+                    return new StringSoaStrategy(orderedRanges);
                 case FastPathVariant.CacheLast:
                     return CreateCacheLast(orderedRanges, hasNumericFastPath);
                 default:
