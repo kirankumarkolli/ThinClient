@@ -13,6 +13,7 @@ namespace Microsoft.Azure.Cosmos.Routing
     using System.Linq;
     using System.Runtime.CompilerServices;
     using Microsoft.Azure.Cosmos.Core.Trace;
+    using Microsoft.Azure.Cosmos.Routing.FastPathVariants.Internal;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Routing;
 
@@ -144,7 +145,7 @@ namespace Microsoft.Azure.Cosmos.Routing
                     // First range min is "" (minimum inclusive) — maps to UInt128.MinValue
                     numericBoundaries[i] = UInt128.MinValue;
                 }
-                else if (CollectionRoutingMap.TryParseHex32ToUInt128(min, out UInt128 val))
+                else if (HexCodec.TryParseHex32ToUInt128(min, out UInt128 val))
                 {
                     numericBoundaries[i] = val;
                 }
@@ -168,7 +169,7 @@ namespace Microsoft.Azure.Cosmos.Routing
                     string min = this.sortedMinBoundaries[i];
                     if (min.Length != 0)
                     {
-                        CollectionRoutingMap.WriteHex32ToBytes(min, byteBoundaries, i * 16);
+                        HexCodec.WriteHex32ToBytes(min, byteBoundaries, i * 16);
                     }
                     // empty min -> all zeros (already default)
                 }
@@ -209,7 +210,7 @@ namespace Microsoft.Azure.Cosmos.Routing
                     string max = orderedPartitionKeyRanges[i].MaxExclusive;
                     if (max != null && max.Length == 32)
                     {
-                        CollectionRoutingMap.WriteHex32ToBytes(max, maxBytes, i * 16);
+                        HexCodec.WriteHex32ToBytes(max, maxBytes, i * 16);
                     }
                     else
                     {
@@ -230,8 +231,8 @@ namespace Microsoft.Azure.Cosmos.Routing
             // original hex string boundaries (avoids needing UInt128 shift operators).
             if (allParsed)
             {
-                this.bucketStart256 = BuildBucketStarts(this.sortedMinBoundaries, 8);
-                this.bucketStart64K = BuildBucketStarts(this.sortedMinBoundaries, 16);
+                this.bucketStart256 = RadixBucketStarts.Build(this.sortedMinBoundaries, 8);
+                this.bucketStart64K = RadixBucketStarts.Build(this.sortedMinBoundaries, 16);
             }
 
             this.lastResolvedIndex = 0;
@@ -382,7 +383,7 @@ namespace Microsoft.Azure.Cosmos.Routing
             // minIdx = largest range index whose Min boundary is <= request.minInclusive.
             // BinarySearchBytesBranchless returns ~lo with upper-bound semantics; ~ret - 1
             // gives that "largest <= key" position.
-            int minIdx = ~CollectionRoutingMap.BinarySearchBytesBranchless(this.sortedByteBoundaries, minInclusive) - 1;
+            int minIdx = ~BinarySearchByBytes.Branchless(this.sortedByteBoundaries, minInclusive) - 1;
             if (minIdx < 0)
             {
                 minIdx = 0;
@@ -391,7 +392,7 @@ namespace Microsoft.Azure.Cosmos.Routing
             // maxIdx = largest range index whose Min boundary is <= request.maxExclusive,
             // then trim by one if that range's Min equals request.maxExclusive (the range
             // starts at the request's exclusive upper bound and therefore does not overlap).
-            int maxIdx = ~CollectionRoutingMap.BinarySearchBytesBranchless(this.sortedByteBoundaries, maxExclusive) - 1;
+            int maxIdx = ~BinarySearchByBytes.Branchless(this.sortedByteBoundaries, maxExclusive) - 1;
             if (maxIdx < 0)
             {
                 maxIdx = 0;
@@ -440,9 +441,9 @@ namespace Microsoft.Azure.Cosmos.Routing
                 && effectivePartitionKeyValue.Length == 32)
             {
                 Span<byte> epkBytes = stackalloc byte[16];
-                if (CollectionRoutingMap.TryParseHex32ToBytes(effectivePartitionKeyValue, epkBytes))
+                if (HexCodec.TryParseHex32ToBytes(effectivePartitionKeyValue, epkBytes))
                 {
-                    int index = CollectionRoutingMap.BinarySearchBytesSeq(this.sortedByteBoundaries, epkBytes);
+                    int index = BinarySearchByBytes.Sequence(this.sortedByteBoundaries, epkBytes);
                     if (index < 0)
                     {
                         index = ~index - 1;
@@ -458,9 +459,9 @@ namespace Microsoft.Azure.Cosmos.Routing
                 && effectivePartitionKeyValue.Length == 32)
             {
                 Span<byte> epkBytes = stackalloc byte[16];
-                if (CollectionRoutingMap.TryParseHex32ToBytes(effectivePartitionKeyValue, epkBytes))
+                if (HexCodec.TryParseHex32ToBytes(effectivePartitionKeyValue, epkBytes))
                 {
-                    int index = CollectionRoutingMap.BinarySearchBytes(this.sortedByteBoundaries, epkBytes);
+                    int index = BinarySearchByBytes.Hand(this.sortedByteBoundaries, epkBytes);
                     if (index < 0)
                     {
                         index = ~index - 1;
@@ -477,9 +478,9 @@ namespace Microsoft.Azure.Cosmos.Routing
                 && effectivePartitionKeyValue.Length == 32)
             {
                 Span<byte> epkBytes = stackalloc byte[16];
-                if (CollectionRoutingMap.TryParseHex32ToBytes(effectivePartitionKeyValue, epkBytes))
+                if (HexCodec.TryParseHex32ToBytes(effectivePartitionKeyValue, epkBytes))
                 {
-                    int index = CollectionRoutingMap.BinarySearchBytesBranchless(this.sortedByteBoundaries, epkBytes);
+                    int index = BinarySearchByBytes.Branchless(this.sortedByteBoundaries, epkBytes);
                     if (index < 0)
                     {
                         index = ~index - 1;
@@ -492,7 +493,7 @@ namespace Microsoft.Azure.Cosmos.Routing
             // Numeric fast path: UInt128 comparison (C).
             if (variant == FastPathVariant.UInt128
                 && this.hasNumericFastPath
-                && CollectionRoutingMap.TryParseHex32ToUInt128(effectivePartitionKeyValue, out UInt128 numericEpk))
+                && HexCodec.TryParseHex32ToUInt128(effectivePartitionKeyValue, out UInt128 numericEpk))
             {
                 int index = Array.BinarySearch(
                     this.sortedNumericBoundaries,
@@ -510,12 +511,12 @@ namespace Microsoft.Azure.Cosmos.Routing
             if (variant == FastPathVariant.Radix1
                 && this.hasNumericFastPath
                 && effectivePartitionKeyValue.Length == 32
-                && CollectionRoutingMap.TryParseHex32ToUInt128(effectivePartitionKeyValue, out UInt128 epkR1))
+                && HexCodec.TryParseHex32ToUInt128(effectivePartitionKeyValue, out UInt128 epkR1))
             {
-                int b = TopBitsFromHex(effectivePartitionKeyValue, 2);
+                int b = HexCodec.TopBitsFromHex(effectivePartitionKeyValue, 2);
                 int lo = this.bucketStart256[b];
                 int hi = this.bucketStart256[b + 1]; // sentinel handles b==255
-                int index = SubarrayBinarySearch(this.sortedNumericBoundaries, lo, hi, epkR1);
+                int index = BinarySearchByBytes.Subarray(this.sortedNumericBoundaries, lo, hi, epkR1);
                 if (index < 0)
                 {
                     index = ~index - 1;
@@ -529,12 +530,12 @@ namespace Microsoft.Azure.Cosmos.Routing
             if (variant == FastPathVariant.Radix2
                 && this.hasNumericFastPath
                 && effectivePartitionKeyValue.Length == 32
-                && CollectionRoutingMap.TryParseHex32ToUInt128(effectivePartitionKeyValue, out UInt128 epkR2))
+                && HexCodec.TryParseHex32ToUInt128(effectivePartitionKeyValue, out UInt128 epkR2))
             {
-                int b = TopBitsFromHex(effectivePartitionKeyValue, 4);
+                int b = HexCodec.TopBitsFromHex(effectivePartitionKeyValue, 4);
                 int lo = this.bucketStart64K[b];
                 int hi = this.bucketStart64K[b + 1];
-                int index = SubarrayBinarySearch(this.sortedNumericBoundaries, lo, hi, epkR2);
+                int index = BinarySearchByBytes.Subarray(this.sortedNumericBoundaries, lo, hi, epkR2);
                 if (index < 0)
                 {
                     index = ~index - 1;
@@ -547,7 +548,7 @@ namespace Microsoft.Azure.Cosmos.Routing
             // CacheLast: try the last resolved index first (range contains EPK?), else UInt128 BS.
             if (variant == FastPathVariant.CacheLast
                 && this.hasNumericFastPath
-                && CollectionRoutingMap.TryParseHex32ToUInt128(effectivePartitionKeyValue, out UInt128 epkCL))
+                && HexCodec.TryParseHex32ToUInt128(effectivePartitionKeyValue, out UInt128 epkCL))
             {
                 int cached = this.lastResolvedIndex;
                 UInt128[] mins = this.sortedNumericBoundaries;
@@ -627,7 +628,7 @@ namespace Microsoft.Azure.Cosmos.Routing
             // Variant-G: branchless binary search + gated prefetch + SoA payload.
             if (CollectionRoutingMap.ActiveVariant == FastPathVariant.Soa)
             {
-                int index = CollectionRoutingMap.BinarySearchBytesBranchless(this.sortedByteBoundaries, key);
+                int index = BinarySearchByBytes.Branchless(this.sortedByteBoundaries, key);
                 if (index < 0)
                 {
                     index = ~index - 1;
@@ -637,7 +638,7 @@ namespace Microsoft.Azure.Cosmos.Routing
             }
             else
             {
-                int index = CollectionRoutingMap.BinarySearchBytes(this.sortedByteBoundaries, key);
+                int index = BinarySearchByBytes.Hand(this.sortedByteBoundaries, key);
                 if (index < 0)
                 {
                     index = ~index - 1;
@@ -783,309 +784,5 @@ namespace Microsoft.Azure.Cosmos.Routing
             return this.goneRanges.Contains(partitionKeyRangeId);
         }
 
-        /// <summary>
-        /// Zero-alloc parser for 32-char continuous hex strings into UInt128.
-        /// Big-endian: first 16 hex chars → high 64 bits, last 16 → low 64 bits.
-        /// Returns false for non-32-char or non-hex input.
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal static bool TryParseHex32ToUInt128(string hex, out UInt128 result)
-        {
-            if (hex.Length != 32)
-            {
-                result = default;
-                return false;
-            }
-
-            if (CollectionRoutingMap.TryParseHexUInt64(hex, 0, out ulong high)
-                && CollectionRoutingMap.TryParseHexUInt64(hex, 16, out ulong low))
-            {
-                result = UInt128.Create(low, high);
-                return true;
-            }
-
-            result = default;
-            return false;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static bool TryParseHexUInt64(string hex, int offset, out ulong value)
-        {
-            value = 0;
-            for (int i = 0; i < 16; i++)
-            {
-                int nibble = CollectionRoutingMap.HexCharToNibble(hex[offset + i]);
-                if (nibble < 0)
-                {
-                    return false;
-                }
-
-                value = (value << 4) | (uint)nibble;
-            }
-
-            return true;
-        }
-
-        /// <summary>
-        /// Parses a 32-char hex string into a 16-byte big-endian span. Returns false on bad input.
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal static bool TryParseHex32ToBytes(string hex, Span<byte> destination)
-        {
-            if (hex.Length != 32 || destination.Length < 16)
-            {
-                return false;
-            }
-
-            for (int i = 0; i < 16; i++)
-            {
-                int hi = CollectionRoutingMap.HexCharToNibble(hex[2 * i]);
-                int lo = CollectionRoutingMap.HexCharToNibble(hex[(2 * i) + 1]);
-                if ((hi | lo) < 0)
-                {
-                    return false;
-                }
-
-                destination[i] = (byte)((hi << 4) | lo);
-            }
-
-            return true;
-        }
-
-        private static void WriteHex32ToBytes(string hex, byte[] dest, int offset)
-        {
-            for (int i = 0; i < 16; i++)
-            {
-                int hi = CollectionRoutingMap.HexCharToNibble(hex[2 * i]);
-                int lo = CollectionRoutingMap.HexCharToNibble(hex[(2 * i) + 1]);
-                dest[offset + i] = (byte)((hi << 4) | lo);
-            }
-        }
-
-        /// <summary>
-        /// Builds a radix bucket-start index over a sorted string[] of 32-char hex boundaries
-        /// (with index 0 possibly being the "" sentinel that maps to all zeros), dispatching by
-        /// the top <paramref name="topBits"/> bits of each boundary. Returned array has length
-        /// (1 &lt;&lt; topBits) + 1; entry [b] is the smallest index whose top bits &gt;= b, with
-        /// [last] = boundaries.Length acting as a sentinel so callers can read [b+1] unconditionally.
-        /// </summary>
-        private static int[] BuildBucketStarts(string[] sortedMinBoundaries, int topBits)
-        {
-            int bucketCount = 1 << topBits;
-            int[] starts = new int[bucketCount + 1];
-            int hexChars = topBits / 4; // 8 bits => 2 hex chars; 16 bits => 4 hex chars
-
-            int j = 0;
-            for (int b = 0; b < bucketCount; b++)
-            {
-                while (j < sortedMinBoundaries.Length
-                    && TopBitsFromHex(sortedMinBoundaries[j], hexChars) < b)
-                {
-                    j++;
-                }
-
-                starts[b] = j;
-            }
-
-            starts[bucketCount] = sortedMinBoundaries.Length;
-            return starts;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static int TopBitsFromHex(string hex, int hexChars)
-        {
-            // Empty (first-range) sentinel — minimum boundary, top bits = 0.
-            if (hex.Length == 0)
-            {
-                return 0;
-            }
-
-            int v = 0;
-            for (int i = 0; i < hexChars; i++)
-            {
-                v = (v << 4) | CollectionRoutingMap.HexCharToNibble(hex[i]);
-            }
-
-            return v;
-        }
-
-        /// <summary>
-        /// Array.BinarySearch over <paramref name="arr"/>[<paramref name="lo"/>..<paramref name="hi"/>)
-        /// for <paramref name="key"/>. Returns matching index or bitwise-complement of insertion
-        /// point (Array.BinarySearch semantics, but bounded to the supplied subrange).
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static int SubarrayBinarySearch(UInt128[] arr, int lo, int hi, UInt128 key)
-        {
-            int length = hi - lo;
-            if (length <= 0)
-            {
-                return ~lo;
-            }
-
-            return Array.BinarySearch(arr, lo, length, key);
-        }
-
-        /// <summary>
-        /// Binary-searches a flat byte[] of 16-byte big-endian boundaries for the given key.
-        /// Returns the index (or bitwise-complement of insertion point), matching Array.BinarySearch semantics.
-        /// </summary>
-        /// <summary>
-        /// Variant D: SequenceCompareTo-based binary search.
-        /// </summary>
-        private static int BinarySearchBytesSeq(byte[] boundaries, ReadOnlySpan<byte> key)
-        {
-            int lo = 0;
-            int hi = (boundaries.Length / 16) - 1;
-            ReadOnlySpan<byte> all = boundaries;
-            while (lo <= hi)
-            {
-                int mid = lo + ((hi - lo) >> 1);
-                int cmp = all.Slice(mid * 16, 16).SequenceCompareTo(key);
-                if (cmp == 0)
-                {
-                    return mid;
-                }
-                else if (cmp < 0)
-                {
-                    lo = mid + 1;
-                }
-                else
-                {
-                    hi = mid - 1;
-                }
-            }
-
-            return ~lo;
-        }
-
-        /// <summary>
-        /// Variant E: hand-rolled binary search using two big-endian ulong reads per probe.
-        /// </summary>
-        private static int BinarySearchBytes(byte[] boundaries, ReadOnlySpan<byte> key)
-        {
-            // Key is exactly 16 bytes big-endian; read it once outside the loop.
-            ulong keyHi = BinaryPrimitives.ReadUInt64BigEndian(key);
-            ulong keyLo = BinaryPrimitives.ReadUInt64BigEndian(key.Slice(8));
-
-            int lo = 0;
-            int hi = (boundaries.Length / 16) - 1;
-            ReadOnlySpan<byte> all = boundaries;
-            while (lo <= hi)
-            {
-                int mid = lo + ((hi - lo) >> 1);
-                ReadOnlySpan<byte> midSpan = all.Slice(mid * 16, 16);
-                ulong midHi = BinaryPrimitives.ReadUInt64BigEndian(midSpan);
-                if (midHi != keyHi)
-                {
-                    if (midHi < keyHi)
-                    {
-                        lo = mid + 1;
-                    }
-                    else
-                    {
-                        hi = mid - 1;
-                    }
-
-                    continue;
-                }
-
-                ulong midLo = BinaryPrimitives.ReadUInt64BigEndian(midSpan.Slice(8));
-                if (midLo == keyLo)
-                {
-                    return mid;
-                }
-                else if (midLo < keyLo)
-                {
-                    lo = mid + 1;
-                }
-                else
-                {
-                    hi = mid - 1;
-                }
-            }
-
-            return ~lo;
-        }
-
-        /// <summary>
-        /// Branchless binary search over the packed 16-byte boundary array. Variant G.
-        /// Differences vs <see cref="BinarySearchBytes"/>:
-        ///   1. Uses upper-bound semantics (<c>mid &lt;= key</c>) instead of the existing
-        ///      <see cref="BinarySearchBytes"/>'s strict-less + equality-short-circuit form.
-        ///      With upper-bound semantics, the answer is uniformly <c>lo - 1</c> regardless
-        ///      of whether an exact match exists, so the loop body has no equality branch.
-        ///      The method always returns <c>~lo</c>; callers' standard
-        ///      <c>if (index &lt; 0) index = ~index - 1;</c> handling produces <c>lo - 1</c>,
-        ///      which is the largest boundary index &lt;= key (exact-match-or-not).
-        ///   2. The probe-direction update (lo / hi) uses arithmetic-mask selection so the
-        ///      JIT can lower it to cmov-style code, avoiding the ~50%-mispredict-rate branch
-        ///      on each iteration of the data-dependent probe direction.
-        ///
-        /// Software prefetch was evaluated but not enabled here because this assembly
-        /// targets netstandard2.0, which doesn't expose <c>System.Runtime.Intrinsics.X86.Sse</c>.
-        /// A conditionally-compiled prefetch path could be added if/when the project gets
-        /// a net6.0 (or later) TFM; the branchless update alone is the primary win.
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static int BinarySearchBytesBranchless(byte[] boundaries, ReadOnlySpan<byte> key)
-        {
-            // Key is exactly 16 bytes big-endian; read it once outside the loop.
-            ulong keyHi = BinaryPrimitives.ReadUInt64BigEndian(key);
-            ulong keyLo = BinaryPrimitives.ReadUInt64BigEndian(key.Slice(8));
-
-            int n = boundaries.Length >> 4;
-            int lo = 0;
-            int hi = n - 1;
-            ReadOnlySpan<byte> all = boundaries;
-
-            while (lo <= hi)
-            {
-                int mid = lo + ((hi - lo) >> 1);
-                int midOffset = mid << 4;
-
-                ulong midHi = BinaryPrimitives.ReadUInt64BigEndian(all.Slice(midOffset, 8));
-                ulong midLo = BinaryPrimitives.ReadUInt64BigEndian(all.Slice(midOffset + 8, 8));
-
-                // mid <= key  iff  midHi < keyHi  OR  (midHi == keyHi AND midLo <= keyLo).
-                // Upper-bound semantics: "advance lo past mid when boundary[mid] <= key".
-                bool midLeq = midHi < keyHi || (midHi == keyHi && midLo <= keyLo);
-                int midLeqInt = System.Runtime.CompilerServices.Unsafe.As<bool, byte>(ref midLeq);
-
-                // mask = -1 (all bits) when mid<=key, else 0. Branchless lo/hi update.
-                int mask = -midLeqInt;
-                int newLo = (mid + 1) & mask;
-                int newHi = (mid - 1) & ~mask;
-                int keepLo = lo & ~mask;
-                int keepHi = hi & mask;
-                lo = newLo | keepLo;
-                hi = newHi | keepHi;
-            }
-
-            // Always return ~lo. Caller does ~index - 1 → lo - 1, which is the largest
-            // index with boundary <= key under the upper-bound semantics above.
-            return ~lo;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static int HexCharToNibble(char c)
-        {
-            if ((uint)(c - '0') <= 9)
-            {
-                return c - '0';
-            }
-
-            if ((uint)(c - 'a') <= 5)
-            {
-                return c - 'a' + 10;
-            }
-
-            if ((uint)(c - 'A') <= 5)
-            {
-                return c - 'A' + 10;
-            }
-
-            return -1;
-        }
     }
 }

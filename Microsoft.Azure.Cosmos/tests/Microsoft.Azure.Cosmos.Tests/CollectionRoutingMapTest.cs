@@ -1,4 +1,4 @@
-﻿//------------------------------------------------------------
+//------------------------------------------------------------
 // Copyright (c) Microsoft Corporation.  All rights reserved.
 //------------------------------------------------------------
 
@@ -9,6 +9,7 @@ namespace Microsoft.Azure.Cosmos.Tests
     using System.Collections.ObjectModel;
     using System.Linq;
     using Microsoft.Azure.Cosmos.Routing;
+    using Microsoft.Azure.Cosmos.Routing.FastPathVariants.Internal;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Routing;
     using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -624,25 +625,25 @@ namespace Microsoft.Azure.Cosmos.Tests
         public void TestTryParseHex32ToUInt128()
         {
             // Valid 32-char hex
-            Assert.IsTrue(CollectionRoutingMap.TryParseHex32ToUInt128("00000000000000000000000000000000", out UInt128 zero));
+            Assert.IsTrue(HexCodec.TryParseHex32ToUInt128("00000000000000000000000000000000", out UInt128 zero));
             Assert.AreEqual(UInt128.Create(0, 0), zero);
 
-            Assert.IsTrue(CollectionRoutingMap.TryParseHex32ToUInt128("00000000000000000000000000000001", out UInt128 one));
+            Assert.IsTrue(HexCodec.TryParseHex32ToUInt128("00000000000000000000000000000001", out UInt128 one));
             Assert.AreEqual(UInt128.Create(1, 0), one);
 
-            Assert.IsTrue(CollectionRoutingMap.TryParseHex32ToUInt128("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", out UInt128 max));
+            Assert.IsTrue(HexCodec.TryParseHex32ToUInt128("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", out UInt128 max));
             Assert.AreEqual(UInt128.Create(ulong.MaxValue, ulong.MaxValue), max);
 
             // Mixed case
-            Assert.IsTrue(CollectionRoutingMap.TryParseHex32ToUInt128("05C1D9cd68C5BA000000000000000000", out UInt128 mixed));
+            Assert.IsTrue(HexCodec.TryParseHex32ToUInt128("05C1D9cd68C5BA000000000000000000", out UInt128 mixed));
             Assert.AreEqual(UInt128.Create(0, 0x05C1D9CD68C5BA00), mixed);
 
             // Invalid: wrong length
-            Assert.IsFalse(CollectionRoutingMap.TryParseHex32ToUInt128("0000000030", out _));
-            Assert.IsFalse(CollectionRoutingMap.TryParseHex32ToUInt128("", out _));
+            Assert.IsFalse(HexCodec.TryParseHex32ToUInt128("0000000030", out _));
+            Assert.IsFalse(HexCodec.TryParseHex32ToUInt128("", out _));
 
             // Invalid: non-hex char
-            Assert.IsFalse(CollectionRoutingMap.TryParseHex32ToUInt128("0000000000000000000000000000000G", out _));
+            Assert.IsFalse(HexCodec.TryParseHex32ToUInt128("0000000000000000000000000000000G", out _));
         }
 
         [TestMethod]

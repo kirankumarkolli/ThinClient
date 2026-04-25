@@ -13,6 +13,7 @@ namespace Microsoft.Azure.Cosmos
     using Microsoft.Azure.Cosmos.Common;
     using Microsoft.Azure.Cosmos.Core.Trace;
     using Microsoft.Azure.Cosmos.Routing;
+    using Microsoft.Azure.Cosmos.Routing.FastPathVariants.Internal;
     using Microsoft.Azure.Cosmos.Tracing;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Rntbd;
@@ -64,7 +65,7 @@ namespace Microsoft.Azure.Cosmos
                 && effectivePartitionKey.Length == 32)
             {
                 Span<byte> epkBytes = stackalloc byte[16];
-                if (CollectionRoutingMap.TryParseHex32ToBytes(effectivePartitionKey, epkBytes))
+                if (HexCodec.TryParseHex32ToBytes(effectivePartitionKey, epkBytes))
                 {
                     EffectivePartitionKey epk = EffectivePartitionKey.FromBigEndianBytes(epkBytes);
                     return routingMap.GetRangeByEffectivePartitionKey(in epk);
