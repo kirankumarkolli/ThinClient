@@ -727,6 +727,19 @@ namespace Microsoft.Azure.Cosmos
                 // In this case server will not pass x-ms-documentdb-collection-rid check and will return back InvalidPartitionException.
                 // Gateway will refresh its cache and retry.
 
+                // Stage 2 producer-side bypass: on V2 hash, compute the EPK directly as UInt128
+                // and route via the opaque-type overload, skipping the byte[16] + Array.Reverse
+                // + ToHex allocation in PartitionKeyInternal.GetEffectivePartitionKeyForHashPartitioningV2
+                // and the matching hex-parse on the routing-map side. Falls back to the string path
+                // for V1 hash, MultiHash, range partitioning, and Empty/Infinity sentinels.
+                if (AddressResolver.UseStringEpkBypass
+                    && routingMap.HasNumericFastPath
+                    && partitionKey.TryGetEffectivePartitionKeyV2Hash(collection.PartitionKey, out Documents.UInt128 numericEpk))
+                {
+                    EffectivePartitionKey epk = EffectivePartitionKey.FromUInt128(numericEpk);
+                    return routingMap.GetRangeByEffectivePartitionKey(in epk);
+                }
+
                 string effectivePartitionKey = partitionKey.GetEffectivePartitionKeyString(collection.PartitionKey);
 
                 // There should be exactly one range which contains a partition key. Always.
