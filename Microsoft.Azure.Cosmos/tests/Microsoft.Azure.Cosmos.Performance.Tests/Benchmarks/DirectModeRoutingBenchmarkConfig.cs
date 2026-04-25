@@ -8,6 +8,8 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
     using BenchmarkDotNet.Columns;
     using BenchmarkDotNet.Configs;
     using BenchmarkDotNet.Diagnosers;
+    using BenchmarkDotNet.Jobs;
+    using Microsoft.Azure.Cosmos.Performance.Tests.Data;
 
     /// <summary>
     /// Benchmark configuration for <see cref="DirectModeRoutingBenchmark"/> that augments the
@@ -17,6 +19,12 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
     /// </summary>
     public sealed class DirectModeRoutingBenchmarkConfig : ManualConfig
     {
+        // Pin invocations-per-iteration to at-least 1.5 × the PKRange count so every iteration
+        // exercises a representative slice of the routing map (and not just a pilot-tuned subset).
+        // UnrollFactor=1 is required because the benchmark is async; with that, InvocationCount
+        // can be any positive value.
+        private const int InvocationsPerIteration = (PkRangeRoutingFactory.ExpectedRowCount * 3 / 2) + 1;
+
         public DirectModeRoutingBenchmarkConfig()
         {
             this.AddColumnProvider(DefaultConfig.Instance.GetColumnProviders().ToArray());
@@ -26,6 +34,10 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
             this.AddValidator(DefaultConfig.Instance.GetValidators().ToArray());
 
             this.AddDiagnoser(MemoryDiagnoser.Default);
+
+            this.AddJob(Job.Default
+                .WithUnrollFactor(1)
+                .WithInvocationCount(InvocationsPerIteration));
 
             this.AddColumn(StatisticColumn.P90);
             this.AddColumn(StatisticColumn.P95);
