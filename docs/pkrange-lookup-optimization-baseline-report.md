@@ -47,22 +47,42 @@ Captured locally; not yet published.
 | ReadItemStream | 15.67 us | 0.260 us | 0.243 us | 15.97 us | 16.03 us | 16.13 us | 6.5015 | 0.0385 |   26.7 KB |
 ```
 
+## Optimized — Phase 1a only (numeric fast-path forced off)
+
+Same merged branch, with `CollectionRoutingMap.hasNumericFastPath` forced to
+`false` locally to isolate the contribution of the zero-allocation string path
+from the UInt128 fast path. Local-only edit, not committed.
+
+```
+|         Method |     Mean |    Error |   StdDev |      P90 |      P95 |     P100 |   Gen0 | Allocated |
+|--------------- |---------:|---------:|---------:|---------:|---------:|---------:|-------:|----------:|
+| ReadItemStream | 15.68 us | 0.304 us | 0.299 us | 16.08 us | 16.13 us | 16.19 us | 6.5015 |  26.69 KB |
+```
+
 ## Comparison
 
-| Metric    | Baseline | Optimized | Delta |
-|-----------|---------:|----------:|------:|
-| Mean      | 18.21 μs | 15.67 μs  | **−14.0%** |
-| StdDev    |  0.704 μs |  0.243 μs | −65.5% (tighter) |
-| P90       | 18.81 μs | 15.97 μs  | −15.1% |
-| P95       | 19.16 μs | 16.03 μs  | −16.3% |
-| P100      | 19.41 μs | 16.13 μs  | −16.9% |
-| Allocated | 26.74 KB | 26.70 KB  | ≈ flat |
+| Metric    | Baseline | Optimized (1a + 2a) | Phase 1a only (2a off) |
+|-----------|---------:|--------------------:|-----------------------:|
+| Mean      | 18.21 μs | 15.67 μs (−14.0%)   | 15.68 μs (−13.9%)      |
+| StdDev    |  0.704 μs |  0.243 μs           |  0.299 μs              |
+| P90       | 18.81 μs | 15.97 μs (−15.1%)   | 16.08 μs (−14.5%)      |
+| P95       | 19.16 μs | 16.03 μs (−16.3%)   | 16.13 μs (−15.8%)      |
+| P100      | 19.41 μs | 16.13 μs (−16.9%)   | 16.19 μs (−16.6%)      |
+| Allocated | 26.74 KB | 26.70 KB            | 26.69 KB               |
 
 ## Notes
 
-- Allocation is unchanged because Phase 1a/2a target CPU on the routing-map lookup
-  path; the per-call request/response object graph dominates the allocation budget
-  and is unaffected.
+- All of the visible end-to-end win at this benchmark scope comes from the
+  Phase 1a zero-allocation string lookup. The Phase 2a UInt128 numeric fast-path
+  is within noise at this granularity — the routing-map lookup itself
+  (sub-microsecond) is dwarfed by the rest of the Direct-mode point-read path
+  (~15 μs of request/response handling, RNTBD framing, address-cache hits,
+  etc.). The micro-benchmark in `CollectionRoutingMapBenchmark` still shows the
+  ~30% lookup-level gain from 2a; that gain just doesn't surface at the E2E
+  level until more of the surrounding overhead is eliminated.
+- Allocation is unchanged because Phase 1a/2a target CPU on the routing-map
+  lookup path; the per-call request/response object graph dominates the
+  allocation budget and is unaffected.
 - The remaining unrealized win — threading the pre-parsed `UInt128` from
   `MurmurHash3.Hash128()` directly into `AddressResolver` to skip per-call
   hex encoding — is not yet wired in. That work is tracked as the next step
