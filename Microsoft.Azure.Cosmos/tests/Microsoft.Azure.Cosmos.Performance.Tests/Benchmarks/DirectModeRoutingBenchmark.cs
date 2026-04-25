@@ -13,6 +13,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
     using Microsoft.Azure.Cosmos.Performance.Tests.Data;
     using Microsoft.Azure.Cosmos.Performance.Tests.Mocks;
     using Microsoft.Azure.Cosmos.Routing;
+    using Microsoft.Azure.Cosmos.Routing.FastPathVariants;
     using Microsoft.Azure.Documents;
     /// <summary>
     /// End-to-end Direct-mode point-read benchmark that exercises the real production SDK
@@ -57,16 +58,16 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
         public void GlobalSetup()
         {
             Environment.SetEnvironmentVariable("COSMOS_PKRANGE_VARIANT", this.Variant);
-            CollectionRoutingMap.ActiveVariant = this.Variant switch
+            FastPathVariantSelector.ActiveVariant = this.Variant switch
             {
-                "string" => CollectionRoutingMap.FastPathVariant.String,
-                "uint128" => CollectionRoutingMap.FastPathVariant.UInt128,
-                "bytespan-seq" => CollectionRoutingMap.FastPathVariant.BytespanSeq,
-                "bytespan-hand" => CollectionRoutingMap.FastPathVariant.BytespanHand,
-                "radix1" => CollectionRoutingMap.FastPathVariant.Radix1,
-                "radix2" => CollectionRoutingMap.FastPathVariant.Radix2,
-                "cache-last" => CollectionRoutingMap.FastPathVariant.CacheLast,
-                _ => CollectionRoutingMap.FastPathVariant.UInt128,
+                "string" => FastPathVariant.String,
+                "uint128" => FastPathVariant.UInt128,
+                "bytespan-seq" => FastPathVariant.BytespanSeq,
+                "bytespan-hand" => FastPathVariant.BytespanHand,
+                "radix1" => FastPathVariant.Radix1,
+                "radix2" => FastPathVariant.Radix2,
+                "cache-last" => FastPathVariant.CacheLast,
+                _ => FastPathVariant.UInt128,
             };
             // MockRequestHelper's static ctor reads samplepayload.json from CWD;
             // under BenchmarkDotNet the working directory points at the host project, so
