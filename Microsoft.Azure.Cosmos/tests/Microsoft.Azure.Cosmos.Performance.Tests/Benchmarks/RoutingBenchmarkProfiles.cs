@@ -33,7 +33,6 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
             "radix2",
             "soa",
             "string-soa",
-            "cache-last",
         };
 
         /// <summary>Resolves a profile token to (variant, bypass) and applies it
@@ -51,7 +50,6 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
                 "radix2"               => (FastPathVariant.Radix2,        true),
                 "soa"                  => (FastPathVariant.Soa,           true),
                 "string-soa"           => (FastPathVariant.StringSoa,     false),
-                "cache-last"           => (FastPathVariant.CacheLast,     true),
                 _ => throw new ArgumentException(
                         $"Unknown routing benchmark profile '{profile}'. Valid values: " +
                         string.Join(", ", AllProfiles), nameof(profile)),

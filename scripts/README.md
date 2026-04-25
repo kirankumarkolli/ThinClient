@@ -9,7 +9,7 @@ Tools for reproducing the PKRange-lookup fast-path optimization numbers reported
 .\scripts\bench-pkrange.ps1
 ```
 
-Builds Performance.Tests in Release, runs all 10 fast-path variants × 2 scenarios
+Builds Performance.Tests in Release, runs all 9 fast-path variants × 2 scenarios
 × 3 alternating passes, then prints a percentile table where each cell shows
 `avg [min..max]` across the 3 passes.
 
@@ -47,7 +47,6 @@ The benchmark `Profile` axis (`[Params]` on `DirectModeRoutingBenchmark` and
 | `radix2`               | `Radix2`        | true   | 2-byte radix index |
 | `soa`                  | `Soa`           | true   | struct-of-arrays + bypass |
 | `string-soa`           | `StringSoa`     | false  | string-keyed SoA (works on V1/hierarchical too) |
-| `cache-last`           | `CacheLast`     | true   | wraps an inner strategy with a single-slot last-hit cache |
 
 > Numeric strategies require V2-hash 32-char hex range boundaries. The factory
 > falls back to `StringStrategy` on non-V2 topologies. `StringSoa` is exempted.
@@ -62,10 +61,10 @@ The benchmark `Profile` axis (`[Params]` on `DirectModeRoutingBenchmark` and
 ## Wrapper usage
 
 ```powershell
-# Full sweep (~45–60 min): 10 variants × 2 scenarios × 3 passes
+# Full sweep (~45–60 min): 9 variants × 2 scenarios × 3 passes
 .\scripts\bench-pkrange.ps1
 
-# Smoke run (~5–8 min): 10 variants × container only × 1 pass
+# Smoke run (~5–8 min): 9 variants × container only × 1 pass
 .\scripts\bench-pkrange.ps1 -Quick
 
 # Skip rebuild (artifacts already in bin\Release)
