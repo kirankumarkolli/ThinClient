@@ -9,6 +9,7 @@ namespace Microsoft.Azure.Cosmos.Tests
     using System.Collections.ObjectModel;
     using System.Linq;
     using Microsoft.Azure.Cosmos.Routing;
+    using Microsoft.Azure.Cosmos.Routing.FastPathVariants;
     using Microsoft.Azure.Cosmos.Routing.FastPathVariants.Internal;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Routing;
@@ -656,34 +657,36 @@ namespace Microsoft.Azure.Cosmos.Tests
             // and locks behavior for subsequent layers (branchless search, prefetch).
 
             const int rangeCount = 64;
-            CollectionRoutingMap routingMap = BuildV2HashRoutingMap(rangeCount, seed: 0xC051);
 
             const int sampleCount = 5_000;
             string[] epks = GenerateRandomHex32Epks(sampleCount, seed: 0xBEEF);
 
             // Capture the baseline (string variant) once.
-            CollectionRoutingMap.FastPathVariant savedVariant = CollectionRoutingMap.ActiveVariant;
+            FastPathVariant savedVariant = FastPathVariantSelector.ActiveVariant;
             try
             {
-                CollectionRoutingMap.ActiveVariant = CollectionRoutingMap.FastPathVariant.String;
+                FastPathVariantSelector.ActiveVariant = FastPathVariant.String;
+                CollectionRoutingMap baselineMap = BuildV2HashRoutingMap(rangeCount, seed: 0xC051);
                 string[] baseline = new string[sampleCount];
                 for (int i = 0; i < sampleCount; i++)
                 {
-                    baseline[i] = routingMap.GetRangeByEffectivePartitionKey(epks[i]).Id;
+                    baseline[i] = baselineMap.GetRangeByEffectivePartitionKey(epks[i]).Id;
                 }
 
-                foreach (CollectionRoutingMap.FastPathVariant variant in new[]
+                foreach (FastPathVariant variant in new[]
                 {
-                    CollectionRoutingMap.FastPathVariant.UInt128,
-                    CollectionRoutingMap.FastPathVariant.BytespanSeq,
-                    CollectionRoutingMap.FastPathVariant.BytespanHand,
-                    CollectionRoutingMap.FastPathVariant.Soa,
+                    FastPathVariant.UInt128,
+                    FastPathVariant.BytespanSeq,
+                    FastPathVariant.BytespanHand,
+                    FastPathVariant.Soa,
                 })
                 {
-                    CollectionRoutingMap.ActiveVariant = variant;
+                    FastPathVariantSelector.ActiveVariant = variant;
+                    // Variant is fixed at construction time, so rebuild the map per variant.
+                    CollectionRoutingMap variantMap = BuildV2HashRoutingMap(rangeCount, seed: 0xC051);
                     for (int i = 0; i < sampleCount; i++)
                     {
-                        string actual = routingMap.GetRangeByEffectivePartitionKey(epks[i]).Id;
+                        string actual = variantMap.GetRangeByEffectivePartitionKey(epks[i]).Id;
                         Assert.AreEqual(
                             baseline[i],
                             actual,
@@ -693,7 +696,7 @@ namespace Microsoft.Azure.Cosmos.Tests
             }
             finally
             {
-                CollectionRoutingMap.ActiveVariant = savedVariant;
+                FastPathVariantSelector.ActiveVariant = savedVariant;
             }
         }
 
@@ -701,7 +704,12 @@ namespace Microsoft.Azure.Cosmos.Tests
         public void TestGetOverlappingRangesByBytes_MatchesStringPath()
         {
             const int rangeCount = 64;
-            CollectionRoutingMap routingMap = BuildV2HashRoutingMap(rangeCount, seed: 0xC051);
+            FastPathVariant savedVariant = FastPathVariantSelector.ActiveVariant;
+            try
+            {
+                // GetOverlappingRangesByBytes is only valid when the SoA fast-path strategy is active.
+                FastPathVariantSelector.ActiveVariant = FastPathVariant.Soa;
+                CollectionRoutingMap routingMap = BuildV2HashRoutingMap(rangeCount, seed: 0xC051);
 
             // 100 random [min, max) sub-ranges, each of length up to ~1/16 of the total
             // 128-bit space, so we hit small / medium / large overlap counts.
@@ -745,6 +753,11 @@ namespace Microsoft.Azure.Cosmos.Tests
                     $"  min = {minHex}\n  max = {maxHex}\n" +
                     $"  string = [{string.Join(",", stringIds)}]\n  bytes  = [{string.Join(",", bytesIds)}]");
             }
+            }
+            finally
+            {
+                FastPathVariantSelector.ActiveVariant = savedVariant;
+            }
         }
 
         private static int CompareBE(byte[] a, byte[] b)
@@ -770,45 +783,49 @@ namespace Microsoft.Azure.Cosmos.Tests
         [TestMethod]
         public void TestSoaFastPath_AfterSplit_ReflectsNewTopology()
         {
-            // Start with a 4-range V2-hash map.
-            CollectionRoutingMap original = BuildV2HashRoutingMap(rangeCount: 4, seed: 0xA110);
-            Assert.AreEqual(4, original.OrderedPartitionKeyRanges.Count);
+            // Local helper: build a fresh original + post-split rebuilt map. Called once
+            // per variant since FastPathStrategy is now baked in at construction.
+            (CollectionRoutingMap Original, CollectionRoutingMap SplitMap) BuildPair()
+            {
+                CollectionRoutingMap orig = BuildV2HashRoutingMap(rangeCount: 4, seed: 0xA110);
+                PartitionKeyRange parent = orig.OrderedPartitionKeyRanges.First(r => r.Id == "1");
+                string splitBoundary = MidpointHex32(parent.MinInclusive, parent.MaxExclusive);
 
-            // Pick the second range (id "1") and split it in half on a new V2-hash boundary
-            // halfway between its [Min, Max). The split children get parents=["1"] so the
-            // parent goes into goneRanges of the rebuilt map.
-            PartitionKeyRange parent = original.OrderedPartitionKeyRanges
-                .First(r => r.Id == "1");
-            string splitBoundary = MidpointHex32(parent.MinInclusive, parent.MaxExclusive);
+                CollectionRoutingMap split = orig.TryCombine(
+                    new[]
+                    {
+                        Tuple.Create(
+                            new PartitionKeyRange
+                            {
+                                Id = "100",
+                                Parents = new System.Collections.ObjectModel.Collection<string> { "1" },
+                                MinInclusive = parent.MinInclusive,
+                                MaxExclusive = splitBoundary,
+                            },
+                            (ServiceIdentity)null),
+                        Tuple.Create(
+                            new PartitionKeyRange
+                            {
+                                Id = "101",
+                                Parents = new System.Collections.ObjectModel.Collection<string> { "1" },
+                                MinInclusive = splitBoundary,
+                                MaxExclusive = parent.MaxExclusive,
+                            },
+                            (ServiceIdentity)null),
+                    },
+                    changeFeedNextIfNoneMatch: string.Empty,
+                    useLengthAwareComparer: false);
 
-            CollectionRoutingMap splitMap = original.TryCombine(
-                new[]
-                {
-                    Tuple.Create(
-                        new PartitionKeyRange
-                        {
-                            Id = "100",
-                            Parents = new System.Collections.ObjectModel.Collection<string> { "1" },
-                            MinInclusive = parent.MinInclusive,
-                            MaxExclusive = splitBoundary,
-                        },
-                        (ServiceIdentity)null),
-                    Tuple.Create(
-                        new PartitionKeyRange
-                        {
-                            Id = "101",
-                            Parents = new System.Collections.ObjectModel.Collection<string> { "1" },
-                            MinInclusive = splitBoundary,
-                            MaxExclusive = parent.MaxExclusive,
-                        },
-                        (ServiceIdentity)null),
-                },
-                changeFeedNextIfNoneMatch: string.Empty,
-                useLengthAwareComparer: false);
+                return (orig, split);
+            }
 
-            Assert.IsNotNull(splitMap, "TryCombine must succeed for a clean parent->children split.");
-            Assert.AreEqual(5, splitMap.OrderedPartitionKeyRanges.Count, "Parent should be replaced by two children -> 4 - 1 + 2 = 5 ranges.");
-            Assert.IsTrue(splitMap.IsGone("1"), "Original parent id should be in goneRanges of the rebuilt map.");
+            // Sanity-check the post-split shape once with the default variant.
+            {
+                (_, CollectionRoutingMap splitMapCheck) = BuildPair();
+                Assert.IsNotNull(splitMapCheck, "TryCombine must succeed for a clean parent->children split.");
+                Assert.AreEqual(5, splitMapCheck.OrderedPartitionKeyRanges.Count, "Parent should be replaced by two children -> 4 - 1 + 2 = 5 ranges.");
+                Assert.IsTrue(splitMapCheck.IsGone("1"), "Original parent id should be in goneRanges of the rebuilt map.");
+            }
 
             // Cross-variant equivalence on the post-split map. If the SoA arrays were
             // not rebuilt, variant G would still resolve EPKs that fall in the parent's
@@ -818,23 +835,25 @@ namespace Microsoft.Azure.Cosmos.Tests
             string[] epks = GenerateRandomHex32Epks(count: 2_000, seed: 0xB22B);
 
             string original_env = Environment.GetEnvironmentVariable("COSMOS_PKRANGE_VARIANT");
-            CollectionRoutingMap.FastPathVariant savedVariant = CollectionRoutingMap.ActiveVariant;
+            FastPathVariant savedVariant = FastPathVariantSelector.ActiveVariant;
             try
             {
                 string[] firstResults = null;
-                CollectionRoutingMap.FastPathVariant firstVariant = default;
+                FastPathVariant firstVariant = default;
                 bool firstSet = false;
 
-                foreach (CollectionRoutingMap.FastPathVariant variant in new[]
+                foreach (FastPathVariant variant in new[]
                 {
-                    CollectionRoutingMap.FastPathVariant.String,
-                    CollectionRoutingMap.FastPathVariant.UInt128,
-                    CollectionRoutingMap.FastPathVariant.BytespanSeq,
-                    CollectionRoutingMap.FastPathVariant.BytespanHand,
-                    CollectionRoutingMap.FastPathVariant.Soa,
+                    FastPathVariant.String,
+                    FastPathVariant.UInt128,
+                    FastPathVariant.BytespanSeq,
+                    FastPathVariant.BytespanHand,
+                    FastPathVariant.Soa,
                 })
                 {
-                    CollectionRoutingMap.ActiveVariant = variant;
+                    FastPathVariantSelector.ActiveVariant = variant;
+                    // Variant is fixed at construction time, so rebuild the split map per variant.
+                    (_, CollectionRoutingMap splitMap) = BuildPair();
 
                     string[] hits = epks.Select(epk => splitMap.GetRangeByEffectivePartitionKey(epk).Id).ToArray();
 
@@ -864,7 +883,7 @@ namespace Microsoft.Azure.Cosmos.Tests
             }
             finally
             {
-                CollectionRoutingMap.ActiveVariant = savedVariant;
+                FastPathVariantSelector.ActiveVariant = savedVariant;
                 Environment.SetEnvironmentVariable("COSMOS_PKRANGE_VARIANT", original_env);
             }
         }
