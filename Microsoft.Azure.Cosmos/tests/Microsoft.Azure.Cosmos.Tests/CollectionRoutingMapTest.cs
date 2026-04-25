@@ -758,6 +758,187 @@ namespace Microsoft.Azure.Cosmos.Tests
             return 0;
         }
 
+        /// <summary>
+        /// Verifies that the SoA fast-path correctly reflects the post-split topology
+        /// after <see cref="CollectionRoutingMap.TryCombine"/> rebuilds the map. PKRanges
+        /// are dynamic at runtime (splits / merges); the routing map is immutable per
+        /// snapshot but a topology change triggers a full reconstruction. Variant G's
+        /// parallel arrays (sortedByteBoundaries / sortedRangePayloads / sortedMaxBytes)
+        /// must be regenerated from scratch on every reconstruction.
+        /// </summary>
+        [TestMethod]
+        public void TestSoaFastPath_AfterSplit_ReflectsNewTopology()
+        {
+            // Start with a 4-range V2-hash map.
+            CollectionRoutingMap original = BuildV2HashRoutingMap(rangeCount: 4, seed: 0xA110);
+            Assert.AreEqual(4, original.OrderedPartitionKeyRanges.Count);
+
+            // Pick the second range (id "1") and split it in half on a new V2-hash boundary
+            // halfway between its [Min, Max). The split children get parents=["1"] so the
+            // parent goes into goneRanges of the rebuilt map.
+            PartitionKeyRange parent = original.OrderedPartitionKeyRanges
+                .First(r => r.Id == "1");
+            string splitBoundary = MidpointHex32(parent.MinInclusive, parent.MaxExclusive);
+
+            CollectionRoutingMap splitMap = original.TryCombine(
+                new[]
+                {
+                    Tuple.Create(
+                        new PartitionKeyRange
+                        {
+                            Id = "100",
+                            Parents = new System.Collections.ObjectModel.Collection<string> { "1" },
+                            MinInclusive = parent.MinInclusive,
+                            MaxExclusive = splitBoundary,
+                        },
+                        (ServiceIdentity)null),
+                    Tuple.Create(
+                        new PartitionKeyRange
+                        {
+                            Id = "101",
+                            Parents = new System.Collections.ObjectModel.Collection<string> { "1" },
+                            MinInclusive = splitBoundary,
+                            MaxExclusive = parent.MaxExclusive,
+                        },
+                        (ServiceIdentity)null),
+                },
+                changeFeedNextIfNoneMatch: string.Empty,
+                useLengthAwareComparer: false);
+
+            Assert.IsNotNull(splitMap, "TryCombine must succeed for a clean parent->children split.");
+            Assert.AreEqual(5, splitMap.OrderedPartitionKeyRanges.Count, "Parent should be replaced by two children -> 4 - 1 + 2 = 5 ranges.");
+            Assert.IsTrue(splitMap.IsGone("1"), "Original parent id should be in goneRanges of the rebuilt map.");
+
+            // Cross-variant equivalence on the post-split map. If the SoA arrays were
+            // not rebuilt, variant G would still resolve EPKs that fall in the parent's
+            // range to the OLD parent payload, while string / uint128 / bytespan-* would
+            // resolve to one of the NEW children. So an equivalence sweep across all
+            // variants on the post-split map is a precise dynamism check.
+            string[] epks = GenerateRandomHex32Epks(count: 2_000, seed: 0xB22B);
+
+            string original_env = Environment.GetEnvironmentVariable("COSMOS_PKRANGE_VARIANT");
+            CollectionRoutingMap.FastPathVariant savedVariant = CollectionRoutingMap.ActiveVariant;
+            try
+            {
+                string[] firstResults = null;
+                CollectionRoutingMap.FastPathVariant firstVariant = default;
+                bool firstSet = false;
+
+                foreach (CollectionRoutingMap.FastPathVariant variant in new[]
+                {
+                    CollectionRoutingMap.FastPathVariant.String,
+                    CollectionRoutingMap.FastPathVariant.UInt128,
+                    CollectionRoutingMap.FastPathVariant.BytespanSeq,
+                    CollectionRoutingMap.FastPathVariant.BytespanHand,
+                    CollectionRoutingMap.FastPathVariant.Soa,
+                })
+                {
+                    CollectionRoutingMap.ActiveVariant = variant;
+
+                    string[] hits = epks.Select(epk => splitMap.GetRangeByEffectivePartitionKey(epk).Id).ToArray();
+
+                    if (!firstSet)
+                    {
+                        firstResults = hits;
+                        firstVariant = variant;
+                        firstSet = true;
+                    }
+                    else
+                    {
+                        for (int i = 0; i < hits.Length; i++)
+                        {
+                            if (hits[i] != firstResults[i])
+                            {
+                                Assert.Fail(
+                                    $"Variant '{variant}' diverged from '{firstVariant}' on EPK {epks[i]} after split: " +
+                                    $"got id={hits[i]}, expected id={firstResults[i]}. " +
+                                    "SoA arrays were not rebuilt to reflect the post-split topology.");
+                            }
+                        }
+                    }
+
+                    // Sanity-check: none of the hits should be the goneRanges parent.
+                    Assert.IsFalse(hits.Contains("1"), $"Variant '{variant}' returned the gone parent range id '1'.");
+                }
+            }
+            finally
+            {
+                CollectionRoutingMap.ActiveVariant = savedVariant;
+                Environment.SetEnvironmentVariable("COSMOS_PKRANGE_VARIANT", original_env);
+            }
+        }
+
+        private static string MidpointHex32(string minHex, string maxHex)
+        {
+            // Compute an interior 32-char hex boundary strictly between minHex and maxHex
+            // (treating both as 128-bit big-endian unsigned integers). Handles the
+            // empty-min sentinel ("" = 0) and the all-FF max sentinel ("FF" => 1<<128).
+            byte[] minBytes = HexToBytesOrZero(minHex);
+            byte[] maxBytes = HexToBytesOrAllFF(maxHex);
+
+            // mid = min + (max - min) / 2, computed byte-wise with carry.
+            byte[] mid = new byte[16];
+            int borrow = 0;
+            byte[] diff = new byte[16];
+            for (int i = 15; i >= 0; i--)
+            {
+                int d = maxBytes[i] - minBytes[i] - borrow;
+                if (d < 0) { d += 256; borrow = 1; } else { borrow = 0; }
+                diff[i] = (byte)d;
+            }
+            // diff /= 2 (right shift by 1)
+            int carry = 0;
+            for (int i = 0; i < 16; i++)
+            {
+                int v = (carry << 8) | diff[i];
+                diff[i] = (byte)(v >> 1);
+                carry = v & 1;
+            }
+            // mid = min + diff
+            int add = 0;
+            for (int i = 15; i >= 0; i--)
+            {
+                int s = minBytes[i] + diff[i] + add;
+                mid[i] = (byte)(s & 0xFF);
+                add = s >> 8;
+            }
+
+            return ToHex32(mid);
+        }
+
+        private static byte[] HexToBytesOrZero(string hex)
+        {
+            byte[] bytes = new byte[16];
+            if (string.IsNullOrEmpty(hex))
+            {
+                return bytes;
+            }
+            for (int i = 0; i < 16; i++)
+            {
+                bytes[i] = (byte)((HexNibble(hex[i * 2]) << 4) | HexNibble(hex[(i * 2) + 1]));
+            }
+            return bytes;
+        }
+
+        private static byte[] HexToBytesOrAllFF(string hex)
+        {
+            if (hex == "FF")
+            {
+                byte[] bytes = new byte[16];
+                for (int i = 0; i < 16; i++) bytes[i] = 0xFF;
+                return bytes;
+            }
+            return HexToBytesOrZero(hex);
+        }
+
+        private static int HexNibble(char c)
+        {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return 0;
+        }
+
         private static CollectionRoutingMap BuildV2HashRoutingMap(int rangeCount, int seed)
         {
             // Generate rangeCount-1 evenly-spaced random 128-bit boundaries, build
