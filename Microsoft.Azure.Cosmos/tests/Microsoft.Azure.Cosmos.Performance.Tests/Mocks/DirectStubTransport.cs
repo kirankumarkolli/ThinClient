@@ -16,28 +16,12 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Mocks
     /// </summary>
     internal sealed class DirectStubTransport : TransportClient
     {
-        public int InvokeCount;
-        public string LastResourceAddress;
-        public OperationType LastOperationType;
-        public int? LastReturnedStatus;
-
-        public void ResetCounters()
-        {
-            this.InvokeCount = 0;
-            this.LastResourceAddress = null;
-            this.LastReturnedStatus = null;
-        }
-
         internal override Task<StoreResponse> InvokeStoreAsync(
             Uri physicalAddress,
             ResourceOperation resourceOperation,
             DocumentServiceRequest request)
         {
-            System.Threading.Interlocked.Increment(ref this.InvokeCount);
-            this.LastResourceAddress = request.ResourceAddress;
-            this.LastOperationType = request.OperationType;
             StoreResponse response = MockRequestHelper.GetStoreResponse(request);
-            this.LastReturnedStatus = response?.Status;
             if (response == null)
             {
                 throw new InvalidOperationException(
