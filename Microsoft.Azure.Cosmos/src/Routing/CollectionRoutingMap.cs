@@ -334,6 +334,22 @@ namespace Microsoft.Azure.Cosmos.Routing
         }
 
         /// <summary>
+        /// Point lookup using an opaque <see cref="EffectivePartitionKey"/>. Skips the
+        /// 32-char hex string round-trip used by the <see cref="GetRangeByEffectivePartitionKey(string)"/>
+        /// overload — callers that produced the EPK from a known V2 hash partition key
+        /// (e.g., via <c>PartitionKeyInternal.TryGetEffectivePartitionKeyV2</c>) should
+        /// prefer this overload.
+        ///
+        /// Only valid when the numeric fast path is active (128-bit hash V2 collections);
+        /// callers must check <see cref="HasNumericFastPath"/> first or fall back to the
+        /// string overload.
+        /// </summary>
+        public PartitionKeyRange GetRangeByEffectivePartitionKey(in EffectivePartitionKey effectivePartitionKey)
+        {
+            return this.GetRangeByEffectivePartitionKey(effectivePartitionKey.ToUInt128());
+        }
+
+        /// <summary>
         /// Point lookup using a pre-parsed UInt128 effective partition key.
         /// Skips hex parsing overhead — callers that already have numeric EPK values
         /// (e.g., from MurmurHash3.Hash128) should prefer this overload.

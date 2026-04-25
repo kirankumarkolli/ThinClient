@@ -28,6 +28,47 @@ namespace Microsoft.Azure.Cosmos
     /// </summary>
     internal sealed class AddressResolver : IAddressResolver
     {
+        /// <summary>
+        /// Stage 1 flight flag for Phase 3b. When true, single-doc CRUD on V2 hash
+        /// collections parses the string EPK once at the AddressResolver boundary into
+        /// an opaque <see cref="EffectivePartitionKey"/> and routes via the new
+        /// numeric-shaped overload, instead of letting <see cref="CollectionRoutingMap"/>
+        /// re-dispatch internally between its string and numeric paths. This is the
+        /// scaffold that lets Stage 2 push the bypass upstream into
+        /// <c>PartitionKeyInternal.GetEffectivePartitionKey*</c> to also eliminate the
+        /// upstream string allocation.
+        ///
+        /// Off by default during soak; flip via env var COSMOS_PKRANGE_BYPASS_STRING_EPK=true.
+        /// </summary>
+        internal static bool UseStringEpkBypass { get; set; } =
+            string.Equals(
+                Environment.GetEnvironmentVariable("COSMOS_PKRANGE_BYPASS_STRING_EPK"),
+                "true",
+                StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Stage 1 helper: parses a 32-char hex EPK string (V2 hash) into an opaque
+        /// <see cref="EffectivePartitionKey"/> and dispatches through the numeric-shape
+        /// routing overload when applicable. Falls back to the existing string overload
+        /// when <see cref="UseStringEpkBypass"/> is off, the routing map doesn't have a
+        /// numeric fast path (V1 / range / hierarchical PK), or the string fails to
+        /// parse as 32-char hex.
+        /// </summary>
+        private static PartitionKeyRange RouteToRangeByEpkString(
+            CollectionRoutingMap routingMap,
+            string effectivePartitionKey)
+        {
+            if (AddressResolver.UseStringEpkBypass
+                && routingMap.HasNumericFastPath
+                && CollectionRoutingMap.TryParseHex32ToUInt128(effectivePartitionKey, out Documents.UInt128 numericEpk))
+            {
+                EffectivePartitionKey epk = EffectivePartitionKey.FromUInt128(numericEpk);
+                return routingMap.GetRangeByEffectivePartitionKey(in epk);
+            }
+
+            return routingMap.GetRangeByEffectivePartitionKey(effectivePartitionKey);
+        }
+
         private readonly IMasterServiceIdentityProvider masterServiceIdentityProvider;
 
         private readonly IRequestSigner requestSigner;
@@ -480,7 +521,7 @@ namespace Microsoft.Azure.Cosmos
                     throw new ArgumentOutOfRangeException(nameof(effectivePartitionKeyString));
                 }
 
-                range = routingMap.GetRangeByEffectivePartitionKey(effectivePartitionKeyString);
+                range = AddressResolver.RouteToRangeByEpkString(routingMap, effectivePartitionKeyString);
             }
             else
             {
@@ -689,7 +730,7 @@ namespace Microsoft.Azure.Cosmos
                 string effectivePartitionKey = partitionKey.GetEffectivePartitionKeyString(collection.PartitionKey);
 
                 // There should be exactly one range which contains a partition key. Always.
-                return routingMap.GetRangeByEffectivePartitionKey(effectivePartitionKey);
+                return AddressResolver.RouteToRangeByEpkString(routingMap, effectivePartitionKey);
             }
 
             if (collectionCacheUptoDate)
