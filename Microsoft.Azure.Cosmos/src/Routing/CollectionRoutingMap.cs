@@ -41,6 +41,8 @@ namespace Microsoft.Azure.Cosmos.Routing
         ///   "uint128"    => Phase 1a + UInt128 fast path  (default)
         ///   "bytespan-seq"  => Phase 1a + byte[16N] with SequenceCompareTo
         ///   "bytespan-hand" => Phase 1a + byte[16N] with hand-rolled ReadUInt64BE compare
+        ///   "soa"           => bytespan-hand + payload SoA (parallel arrays, no List indirection)
+        ///                      + branchless binary search + gated software prefetch.
         /// </summary>
         internal enum FastPathVariant
         {
@@ -48,6 +50,7 @@ namespace Microsoft.Azure.Cosmos.Routing
             UInt128,
             BytespanSeq,
             BytespanHand,
+            Soa,
         }
 
         internal static FastPathVariant ActiveVariant { get; set; } =
@@ -62,6 +65,7 @@ namespace Microsoft.Azure.Cosmos.Routing
                 case "uint128": return FastPathVariant.UInt128;
                 case "bytespan-seq": return FastPathVariant.BytespanSeq;
                 case "bytespan-hand": return FastPathVariant.BytespanHand;
+                case "soa": return FastPathVariant.Soa;
                 default: return FastPathVariant.UInt128;
             }
         }
@@ -284,6 +288,29 @@ namespace Microsoft.Azure.Cosmos.Routing
 
             // Span<byte> fast path with hand-rolled ReadUInt64BE compare (E).
             if (variant == FastPathVariant.BytespanHand
+                && this.hasNumericFastPath
+                && effectivePartitionKeyValue.Length == 32)
+            {
+                Span<byte> epkBytes = stackalloc byte[16];
+                if (CollectionRoutingMap.TryParseHex32ToBytes(effectivePartitionKeyValue, epkBytes))
+                {
+                    int index = CollectionRoutingMap.BinarySearchBytes(this.sortedByteBoundaries, epkBytes);
+                    if (index < 0)
+                    {
+                        index = ~index - 1;
+                    }
+
+                    return this.orderedPartitionKeyRanges[index];
+                }
+            }
+
+            // SoA fast path (G): bytespan-hand search + payload SoA (no List<T> indirection)
+            // + branchless binary search + gated software prefetch.
+            // Layer-staged: in this commit it points at the bytespan-hand implementation
+            // (no behavior change) so the variant wiring can be validated end-to-end.
+            // Subsequent commits will swap the search routine and payload array as each
+            // SoA layer lands.
+            if (variant == FastPathVariant.Soa
                 && this.hasNumericFastPath
                 && effectivePartitionKeyValue.Length == 32)
             {
