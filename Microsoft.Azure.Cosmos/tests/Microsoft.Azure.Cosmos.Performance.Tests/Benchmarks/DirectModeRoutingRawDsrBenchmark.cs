@@ -58,9 +58,16 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
         private DirectStubTransport transport;
         private string[] pkPool;
 
+        [ParamsSource(nameof(Profiles))]
+        public string Profile { get; set; }
+
+        public static IEnumerable<string> Profiles => RoutingBenchmarkProfiles.AllProfiles;
+
         [GlobalSetup]
         public void GlobalSetup()
         {
+            RoutingBenchmarkProfiles.Apply(this.Profile);
+
             string exeDir = Path.GetDirectoryName(typeof(DirectModeRoutingRawDsrBenchmark).Assembly.Location);
             if (!string.IsNullOrEmpty(exeDir))
             {

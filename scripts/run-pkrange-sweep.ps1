@@ -1,9 +1,12 @@
-# 3-pass alternating-order routing sweep across all variants for both
-# DirectModeRoutingBenchmark (Container path) and DirectModeRoutingRawDsrBenchmark
-# (raw-DSR path). Captures raw per-iteration measurements via CsvMeasurementsExporter
-# so high-tail percentiles can be computed offline.
+# Alternating-order routing-benchmark sweep.
 #
-# Output: $OutDir\<scenario>\p<pass>-<label>.csv
+# The benchmarks (DirectModeRoutingBenchmark, DirectModeRoutingRawDsrBenchmark)
+# expose a `Profile` [Params] axis and apply each profile's (variant, bypass)
+# tuple in GlobalSetup. BenchmarkDotNet handles per-profile process isolation
+# and invocation ordering — this script just drives N passes per scenario.
+#
+# Output: $OutDir\<scenario>\p<pass>.csv  (one consolidated CSV per pass,
+#         containing all profiles; the aggregator demultiplexes by Param_Profile.)
 
 [CmdletBinding()]
 param(
@@ -16,20 +19,9 @@ param(
 $ErrorActionPreference = 'Continue'
 Set-Location $RepoRoot
 
-# Variant token = COSMOS_PKRANGE_VARIANT value; output files named after Label.
-# Labels avoid characters that would be awkward in file names.
-$variants = @(
-    @{ Label = 'string';               Variant = 'string';        Bypass = 'false' },
-    @{ Label = 'uint128';              Variant = 'uint128';       Bypass = 'false' },
-    @{ Label = 'bytespan-seq';         Variant = 'bytespan-seq';  Bypass = 'false' },
-    @{ Label = 'bytespan-hand';        Variant = 'bytespan-hand'; Bypass = 'false' },
-    @{ Label = 'bytespan-hand-bypass'; Variant = 'bytespan-hand'; Bypass = 'true'  },
-    @{ Label = 'radix1';               Variant = 'radix1';        Bypass = 'true'  },
-    @{ Label = 'radix2';               Variant = 'radix2';        Bypass = 'true'  },
-    @{ Label = 'soa';                  Variant = 'soa';           Bypass = 'true'  },
-    @{ Label = 'string-soa';           Variant = 'string-soa';    Bypass = 'false' },
-    @{ Label = 'cache-last';           Variant = 'cache-last';    Bypass = 'true'  }
-)
+$projectDir = Join-Path $RepoRoot 'Microsoft.Azure.Cosmos\tests\Microsoft.Azure.Cosmos.Performance.Tests'
+$dllPath    = Join-Path $projectDir 'bin\Release\net8.0\Microsoft.Azure.Cosmos.Performance.Tests.dll'
+if (-not (Test-Path $dllPath)) { throw "Benchmark DLL not found: $dllPath (build with -c Release first)" }
 
 $allScenarios = @(
     @{ Name = 'rawdsr';    Filter = '*DirectModeRoutingRawDsrBenchmark*' },
@@ -38,9 +30,6 @@ $allScenarios = @(
 $scenarios = $allScenarios | Where-Object { $Scenarios -contains $_.Name }
 if (-not $scenarios) { throw "No matching scenarios in: $($Scenarios -join ',')" }
 
-$projectDir = Join-Path $RepoRoot 'Microsoft.Azure.Cosmos\tests\Microsoft.Azure.Cosmos.Performance.Tests'
-$dllPath    = Join-Path $projectDir 'bin\Release\net8.0\Microsoft.Azure.Cosmos.Performance.Tests.dll'
-
 $env:DOTNET_ROLL_FORWARD = 'LatestMajor'
 
 foreach ($scenario in $scenarios) {
@@ -48,26 +37,25 @@ foreach ($scenario in $scenarios) {
     New-Item -ItemType Directory -Force -Path $scenarioOut | Out-Null
 
     for ($pass = 1; $pass -le $Passes; $pass++) {
-        foreach ($v in $variants) {
-            $label = $v.Label
-            $stamp = Get-Date -Format 'HH:mm:ss'
-            Write-Host "[$stamp] scenario=$($scenario.Name) pass=$pass label=$label variant=$($v.Variant) bypass=$($v.Bypass)"
+        $stamp = Get-Date -Format 'HH:mm:ss'
+        Write-Host "[$stamp] scenario=$($scenario.Name) pass=$pass" -ForegroundColor Yellow
 
-            $env:COSMOS_PKRANGE_VARIANT          = $v.Variant
-            $env:COSMOS_PKRANGE_BYPASS_STRING_EPK = $v.Bypass
+        $artifactsDir = Join-Path $scenarioOut "p$pass-artifacts"
+        New-Item -ItemType Directory -Force -Path $artifactsDir | Out-Null
+        $logFile = Join-Path $scenarioOut "p$pass.log"
 
-            $artifactsDir = Join-Path $scenarioOut "p$pass-$label-artifacts"
-            New-Item -ItemType Directory -Force -Path $artifactsDir | Out-Null
+        # BDN spawns one child process per [Params] value (each profile),
+        # cycling them in alpha order — alternation is preserved across passes.
+        & dotnet $dllPath --filter $scenario.Filter --artifacts $artifactsDir 2>&1 |
+            Tee-Object -FilePath $logFile | Out-Null
 
-            $logFile = Join-Path $scenarioOut "p$pass-$label.log"
-            & dotnet $dllPath --filter $scenario.Filter --artifacts $artifactsDir 2>&1 | Tee-Object -FilePath $logFile | Out-Null
-
-            $csvHit = Get-ChildItem -Path $artifactsDir -Recurse -Filter '*-measurements.csv' -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($csvHit) {
-                Copy-Item $csvHit.FullName -Destination (Join-Path $scenarioOut "p$pass-$label.csv") -Force
-            } else {
-                Write-Warning "No measurements CSV produced for scenario=$($scenario.Name) pass=$pass label=$label"
-            }
+        # Consolidated measurements CSV: one row per (profile, iteration).
+        $csvHit = Get-ChildItem -Path $artifactsDir -Recurse -Filter '*-measurements.csv' `
+                  -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($csvHit) {
+            Copy-Item $csvHit.FullName -Destination (Join-Path $scenarioOut "p$pass.csv") -Force
+        } else {
+            Write-Warning "No measurements CSV produced for scenario=$($scenario.Name) pass=$pass"
         }
     }
 }
