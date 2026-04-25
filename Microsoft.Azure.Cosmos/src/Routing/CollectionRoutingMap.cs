@@ -35,6 +35,14 @@ namespace Microsoft.Azure.Cosmos.Routing
         private readonly byte[] sortedMaxBytes;       // flat: 16 bytes per range MAX (exclusive), big-endian. Layer 3.
         private readonly bool hasNumericFastPath;
 
+        // Radix index: bucketStart256[b] = first index in sortedNumericBoundaries whose top byte >= b.
+        // Sentinel at [256] = ranges.Count. Built only when hasNumericFastPath. ~1 KB per map.
+        private readonly int[] bucketStart256;
+
+        // Radix index: bucketStart64K[b] = first index whose top 16 bits >= b.
+        // Sentinel at [65536] = ranges.Count. Built only when hasNumericFastPath. ~256 KB per map.
+        private readonly int[] bucketStart64K;
+
         // Payload SoA (Layer 1, variant G).
         // Parallel array of PartitionKeyRange references with the same ordering as
         // sortedByteBoundaries and orderedPartitionKeyRanges. Reads in the V2-hash
@@ -46,15 +54,22 @@ namespace Microsoft.Azure.Cosmos.Routing
         private readonly string[] sortedRangeIds;
         private readonly ServiceIdentity[] sortedServiceIdentities;
 
+        // Last-resolved-index cache for the LastResolvedCache variant. Single int, racy reads OK
+        // (worst case: cache miss leads to fallthrough to UInt128 binary search).
+        private int lastResolvedIndex;
+
         /// <summary>
         /// Experimental variant selector for benchmarking the routing-map point lookup.
         /// Controlled by env var COSMOS_PKRANGE_VARIANT:
-        ///   "string"     => Phase 1a only (string Array.BinarySearch)
-        ///   "uint128"    => Phase 1a + UInt128 fast path  (default)
-        ///   "bytespan-seq"  => Phase 1a + byte[16N] with SequenceCompareTo
-        ///   "bytespan-hand" => Phase 1a + byte[16N] with hand-rolled ReadUInt64BE compare
-        ///   "soa"           => bytespan-hand + payload SoA (parallel arrays, no List indirection)
-        ///                      + branchless binary search + gated software prefetch.
+        ///   "string"          => Phase 1a only (string Array.BinarySearch)
+        ///   "uint128"         => Phase 1a + UInt128 fast path  (default)
+        ///   "bytespan-seq"    => Phase 1a + byte[16N] with SequenceCompareTo
+        ///   "bytespan-hand"   => Phase 1a + byte[16N] with hand-rolled ReadUInt64BE compare
+        ///   "radix1"          => UInt128 + top-byte (256-bucket) radix dispatch
+        ///   "radix2"          => UInt128 + top-16-bit (65536-bucket) radix dispatch
+        ///   "cache-last"      => UInt128 + last-resolved-index cache fast path
+        ///   "soa"             => bytespan-hand + payload SoA (parallel arrays, no List indirection)
+        ///                        + branchless binary search + gated software prefetch.
         /// </summary>
         internal enum FastPathVariant
         {
@@ -62,6 +77,9 @@ namespace Microsoft.Azure.Cosmos.Routing
             UInt128,
             BytespanSeq,
             BytespanHand,
+            Radix1,
+            Radix2,
+            CacheLast,
             Soa,
         }
 
@@ -77,6 +95,9 @@ namespace Microsoft.Azure.Cosmos.Routing
                 case "uint128": return FastPathVariant.UInt128;
                 case "bytespan-seq": return FastPathVariant.BytespanSeq;
                 case "bytespan-hand": return FastPathVariant.BytespanHand;
+                case "radix1": return FastPathVariant.Radix1;
+                case "radix2": return FastPathVariant.Radix2;
+                case "cache-last": return FastPathVariant.CacheLast;
                 case "soa": return FastPathVariant.Soa;
                 default: return FastPathVariant.UInt128;
             }
@@ -203,6 +224,17 @@ namespace Microsoft.Azure.Cosmos.Routing
 
                 this.sortedMaxBytes = maxBytes;
             }
+
+            // Radix indexes for Radix1/Radix2/CacheLast variants. Built only when numeric
+            // fast path is active (V2 hash collections). Top bits are extracted from the
+            // original hex string boundaries (avoids needing UInt128 shift operators).
+            if (allParsed)
+            {
+                this.bucketStart256 = BuildBucketStarts(this.sortedMinBoundaries, 8);
+                this.bucketStart64K = BuildBucketStarts(this.sortedMinBoundaries, 16);
+            }
+
+            this.lastResolvedIndex = 0;
 
             this.CollectionUniqueId = collectionUniqueId;
             this.ChangeFeedNextIfNoneMatch = changeFeedNextIfNoneMatch;
@@ -471,6 +503,71 @@ namespace Microsoft.Azure.Cosmos.Routing
                     index = ~index - 1;
                 }
 
+                return this.orderedPartitionKeyRanges[index];
+            }
+
+            // Radix1: top-byte (256-bucket) dispatch then narrow UInt128 binary search.
+            if (variant == FastPathVariant.Radix1
+                && this.hasNumericFastPath
+                && effectivePartitionKeyValue.Length == 32
+                && CollectionRoutingMap.TryParseHex32ToUInt128(effectivePartitionKeyValue, out UInt128 epkR1))
+            {
+                int b = TopBitsFromHex(effectivePartitionKeyValue, 2);
+                int lo = this.bucketStart256[b];
+                int hi = this.bucketStart256[b + 1]; // sentinel handles b==255
+                int index = SubarrayBinarySearch(this.sortedNumericBoundaries, lo, hi, epkR1);
+                if (index < 0)
+                {
+                    index = ~index - 1;
+                    if (index < 0) index = 0;
+                }
+
+                return this.orderedPartitionKeyRanges[index];
+            }
+
+            // Radix2: top-16-bit (65536-bucket) dispatch then narrow UInt128 binary search.
+            if (variant == FastPathVariant.Radix2
+                && this.hasNumericFastPath
+                && effectivePartitionKeyValue.Length == 32
+                && CollectionRoutingMap.TryParseHex32ToUInt128(effectivePartitionKeyValue, out UInt128 epkR2))
+            {
+                int b = TopBitsFromHex(effectivePartitionKeyValue, 4);
+                int lo = this.bucketStart64K[b];
+                int hi = this.bucketStart64K[b + 1];
+                int index = SubarrayBinarySearch(this.sortedNumericBoundaries, lo, hi, epkR2);
+                if (index < 0)
+                {
+                    index = ~index - 1;
+                    if (index < 0) index = 0;
+                }
+
+                return this.orderedPartitionKeyRanges[index];
+            }
+
+            // CacheLast: try the last resolved index first (range contains EPK?), else UInt128 BS.
+            if (variant == FastPathVariant.CacheLast
+                && this.hasNumericFastPath
+                && CollectionRoutingMap.TryParseHex32ToUInt128(effectivePartitionKeyValue, out UInt128 epkCL))
+            {
+                int cached = this.lastResolvedIndex;
+                UInt128[] mins = this.sortedNumericBoundaries;
+                if ((uint)cached < (uint)mins.Length)
+                {
+                    bool minOk = epkCL >= mins[cached];
+                    bool maxOk = (cached + 1 == mins.Length) || epkCL < mins[cached + 1];
+                    if (minOk && maxOk)
+                    {
+                        return this.orderedPartitionKeyRanges[cached];
+                    }
+                }
+
+                int index = Array.BinarySearch(mins, epkCL);
+                if (index < 0)
+                {
+                    index = ~index - 1;
+                }
+
+                this.lastResolvedIndex = index;
                 return this.orderedPartitionKeyRanges[index];
             }
 
@@ -763,6 +860,70 @@ namespace Microsoft.Azure.Cosmos.Routing
                 int lo = CollectionRoutingMap.HexCharToNibble(hex[(2 * i) + 1]);
                 dest[offset + i] = (byte)((hi << 4) | lo);
             }
+        }
+
+        /// <summary>
+        /// Builds a radix bucket-start index over a sorted string[] of 32-char hex boundaries
+        /// (with index 0 possibly being the "" sentinel that maps to all zeros), dispatching by
+        /// the top <paramref name="topBits"/> bits of each boundary. Returned array has length
+        /// (1 &lt;&lt; topBits) + 1; entry [b] is the smallest index whose top bits &gt;= b, with
+        /// [last] = boundaries.Length acting as a sentinel so callers can read [b+1] unconditionally.
+        /// </summary>
+        private static int[] BuildBucketStarts(string[] sortedMinBoundaries, int topBits)
+        {
+            int bucketCount = 1 << topBits;
+            int[] starts = new int[bucketCount + 1];
+            int hexChars = topBits / 4; // 8 bits => 2 hex chars; 16 bits => 4 hex chars
+
+            int j = 0;
+            for (int b = 0; b < bucketCount; b++)
+            {
+                while (j < sortedMinBoundaries.Length
+                    && TopBitsFromHex(sortedMinBoundaries[j], hexChars) < b)
+                {
+                    j++;
+                }
+
+                starts[b] = j;
+            }
+
+            starts[bucketCount] = sortedMinBoundaries.Length;
+            return starts;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int TopBitsFromHex(string hex, int hexChars)
+        {
+            // Empty (first-range) sentinel — minimum boundary, top bits = 0.
+            if (hex.Length == 0)
+            {
+                return 0;
+            }
+
+            int v = 0;
+            for (int i = 0; i < hexChars; i++)
+            {
+                v = (v << 4) | CollectionRoutingMap.HexCharToNibble(hex[i]);
+            }
+
+            return v;
+        }
+
+        /// <summary>
+        /// Array.BinarySearch over <paramref name="arr"/>[<paramref name="lo"/>..<paramref name="hi"/>)
+        /// for <paramref name="key"/>. Returns matching index or bitwise-complement of insertion
+        /// point (Array.BinarySearch semantics, but bounded to the supplied subrange).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int SubarrayBinarySearch(UInt128[] arr, int lo, int hi, UInt128 key)
+        {
+            int length = hi - lo;
+            if (length <= 0)
+            {
+                return ~lo;
+            }
+
+            return Array.BinarySearch(arr, lo, length, key);
         }
 
         /// <summary>
