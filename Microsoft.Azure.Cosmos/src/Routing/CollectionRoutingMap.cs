@@ -34,6 +34,17 @@ namespace Microsoft.Azure.Cosmos.Routing
         private readonly byte[] sortedByteBoundaries; // flat: 16 bytes per range, big-endian
         private readonly bool hasNumericFastPath;
 
+        // Payload SoA (Layer 1, variant G).
+        // Parallel array of PartitionKeyRange references with the same ordering as
+        // sortedByteBoundaries and orderedPartitionKeyRanges. Reads in the V2-hash
+        // hot path go through this T[] (single bounds-checked index) instead of
+        // List<T>, avoiding the List indirection layer. orderedPartitionKeyRanges
+        // is retained because it backs the public OrderedPartitionKeyRanges
+        // IReadOnlyList<PartitionKeyRange> property.
+        private readonly PartitionKeyRange[] sortedRangePayloads;
+        private readonly string[] sortedRangeIds;
+        private readonly ServiceIdentity[] sortedServiceIdentities;
+
         /// <summary>
         /// Experimental variant selector for benchmarking the routing-map point lookup.
         /// Controlled by env var COSMOS_PKRANGE_VARIANT:
@@ -141,6 +152,28 @@ namespace Microsoft.Azure.Cosmos.Routing
                 }
 
                 this.sortedByteBoundaries = byteBoundaries;
+
+                // Layer 1 — Payload SoA. Build parallel arrays of just-what-the-hot-path-needs.
+                // sortedRangePayloads is a plain T[] (no List<T>) so the variant-G hot path
+                // returns sortedRangePayloads[index] without the List indirection.
+                int n = orderedPartitionKeyRanges.Count;
+                PartitionKeyRange[] payloads = new PartitionKeyRange[n];
+                string[] rangeIds = new string[n];
+                ServiceIdentity[] serviceIdentities = new ServiceIdentity[n];
+                for (int i = 0; i < n; i++)
+                {
+                    PartitionKeyRange pkr = orderedPartitionKeyRanges[i];
+                    payloads[i] = pkr;
+                    rangeIds[i] = pkr.Id;
+                    if (rangeById.TryGetValue(pkr.Id, out Tuple<PartitionKeyRange, ServiceIdentity> entry))
+                    {
+                        serviceIdentities[i] = entry.Item2;
+                    }
+                }
+
+                this.sortedRangePayloads = payloads;
+                this.sortedRangeIds = rangeIds;
+                this.sortedServiceIdentities = serviceIdentities;
             }
 
             this.CollectionUniqueId = collectionUniqueId;
@@ -306,10 +339,9 @@ namespace Microsoft.Azure.Cosmos.Routing
 
             // SoA fast path (G): bytespan-hand search + payload SoA (no List<T> indirection)
             // + branchless binary search + gated software prefetch.
-            // Layer-staged: in this commit it points at the bytespan-hand implementation
-            // (no behavior change) so the variant wiring can be validated end-to-end.
-            // Subsequent commits will swap the search routine and payload array as each
-            // SoA layer lands.
+            // Layer 1 (this commit): bytespan-hand search + sortedRangePayloads array index
+            // (no List<T> indirection).
+            // Layers 2 + 3 land in subsequent commits.
             if (variant == FastPathVariant.Soa
                 && this.hasNumericFastPath
                 && effectivePartitionKeyValue.Length == 32)
@@ -323,7 +355,7 @@ namespace Microsoft.Azure.Cosmos.Routing
                         index = ~index - 1;
                     }
 
-                    return this.orderedPartitionKeyRanges[index];
+                    return this.sortedRangePayloads[index];
                 }
             }
 
@@ -401,6 +433,12 @@ namespace Microsoft.Azure.Cosmos.Routing
             if (index < 0)
             {
                 index = ~index - 1;
+            }
+
+            // Variant-G: read payload from the SoA array (no List<T> indirection).
+            if (CollectionRoutingMap.ActiveVariant == FastPathVariant.Soa)
+            {
+                return this.sortedRangePayloads[index];
             }
 
             return this.orderedPartitionKeyRanges[index];

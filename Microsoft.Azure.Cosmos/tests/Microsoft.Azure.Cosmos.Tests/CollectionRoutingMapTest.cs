@@ -644,5 +644,130 @@ namespace Microsoft.Azure.Cosmos.Tests
             // Invalid: non-hex char
             Assert.IsFalse(CollectionRoutingMap.TryParseHex32ToUInt128("0000000000000000000000000000000G", out _));
         }
+
+        [TestMethod]
+        public void TestVariantEquivalence_AllVariantsAgreeOnRandomEpks()
+        {
+            // Build a V2-hash routing map with N evenly-spaced 128-bit boundaries
+            // and assert every FastPathVariant resolves the same range id for the
+            // same EPK input. Catches Layer 1 (payload SoA) regressions where the
+            // sortedRangePayloads array could fall out of sync with orderedPartitionKeyRanges,
+            // and locks behavior for subsequent layers (branchless search, prefetch).
+
+            const int rangeCount = 64;
+            CollectionRoutingMap routingMap = BuildV2HashRoutingMap(rangeCount, seed: 0xC051);
+
+            const int sampleCount = 5_000;
+            string[] epks = GenerateRandomHex32Epks(sampleCount, seed: 0xBEEF);
+
+            // Capture the baseline (string variant) once.
+            CollectionRoutingMap.FastPathVariant savedVariant = CollectionRoutingMap.ActiveVariant;
+            try
+            {
+                CollectionRoutingMap.ActiveVariant = CollectionRoutingMap.FastPathVariant.String;
+                string[] baseline = new string[sampleCount];
+                for (int i = 0; i < sampleCount; i++)
+                {
+                    baseline[i] = routingMap.GetRangeByEffectivePartitionKey(epks[i]).Id;
+                }
+
+                foreach (CollectionRoutingMap.FastPathVariant variant in new[]
+                {
+                    CollectionRoutingMap.FastPathVariant.UInt128,
+                    CollectionRoutingMap.FastPathVariant.BytespanSeq,
+                    CollectionRoutingMap.FastPathVariant.BytespanHand,
+                    CollectionRoutingMap.FastPathVariant.Soa,
+                })
+                {
+                    CollectionRoutingMap.ActiveVariant = variant;
+                    for (int i = 0; i < sampleCount; i++)
+                    {
+                        string actual = routingMap.GetRangeByEffectivePartitionKey(epks[i]).Id;
+                        Assert.AreEqual(
+                            baseline[i],
+                            actual,
+                            $"Variant {variant} disagreed with String baseline on EPK {epks[i]} (sample {i}).");
+                    }
+                }
+            }
+            finally
+            {
+                CollectionRoutingMap.ActiveVariant = savedVariant;
+            }
+        }
+
+        private static CollectionRoutingMap BuildV2HashRoutingMap(int rangeCount, int seed)
+        {
+            // Generate rangeCount-1 evenly-spaced random 128-bit boundaries, build
+            // ranges [0,b0), [b0,b1), ..., [bN-2,FF].
+            Random rng = new Random(seed);
+            byte[] bytes = new byte[16];
+            string[] boundaries = new string[rangeCount - 1];
+            for (int i = 0; i < rangeCount - 1; i++)
+            {
+                rng.NextBytes(bytes);
+                if (bytes[0] == 0xFF)
+                {
+                    bytes[0] = 0xFE;
+                }
+                boundaries[i] = ToHex32(bytes);
+            }
+            Array.Sort(boundaries, StringComparer.Ordinal);
+
+            List<Tuple<PartitionKeyRange, ServiceIdentity>> ranges =
+                new List<Tuple<PartitionKeyRange, ServiceIdentity>>(rangeCount);
+
+            for (int i = 0; i < rangeCount; i++)
+            {
+                string min = i == 0 ? string.Empty : boundaries[i - 1];
+                string max = i == rangeCount - 1 ? "FF" : boundaries[i];
+                ranges.Add(Tuple.Create(
+                    new PartitionKeyRange { Id = i.ToString(), MinInclusive = min, MaxExclusive = max },
+                    (ServiceIdentity)null));
+            }
+
+            CollectionRoutingMap routingMap = CollectionRoutingMap.TryCreateCompleteRoutingMap(
+                ranges,
+                string.Empty,
+                false);
+            Assert.IsNotNull(routingMap);
+            return routingMap;
+        }
+
+        private static string[] GenerateRandomHex32Epks(int count, int seed)
+        {
+            // PartitionKeyInternal.MaximumExclusiveEffectivePartitionKey is the literal "FF",
+            // and GetRangeByEffectivePartitionKey throws when the input compares >= "FF"
+            // ordinally. Any 32-char hex EPK starting with "FF" sorts strictly after "FF"
+            // (shorter-prefix-sorts-first), so we cap the leading byte to 0xFE to keep
+            // every generated sample inside the addressable range.
+            Random rng = new Random(seed);
+            byte[] bytes = new byte[16];
+            string[] result = new string[count];
+            for (int i = 0; i < count; i++)
+            {
+                rng.NextBytes(bytes);
+                if (bytes[0] == 0xFF)
+                {
+                    bytes[0] = 0xFE;
+                }
+                result[i] = ToHex32(bytes);
+            }
+            return result;
+        }
+
+        private static string ToHex32(byte[] bytes)
+        {
+            char[] chars = new char[32];
+            for (int i = 0; i < 16; i++)
+            {
+                byte b = bytes[i];
+                chars[i * 2] = HexChar(b >> 4);
+                chars[i * 2 + 1] = HexChar(b & 0x0F);
+            }
+            return new string(chars);
+        }
+
+        private static char HexChar(int nibble) => (char)(nibble < 10 ? '0' + nibble : 'A' + (nibble - 10));
     }
 }
