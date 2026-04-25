@@ -18,42 +18,39 @@ Builds Performance.Tests in Release, runs all 10 fast-path variants × 2 scenari
 | Script | Purpose |
 | ------ | ------- |
 | `bench-pkrange.ps1`              | One-shot wrapper: build + sweep + report. |
-| `run-pkrange-sweep.ps1`          | Sweep only: produces per-(pass, variant) raw measurement CSVs. |
-| `compute-pkrange-percentiles.ps1`| Aggregator: computes Avg/Min/Max + percentiles per pass, then renders `avg [min..max]` across passes. |
+| `run-pkrange-sweep.ps1`          | Sweep only: invokes BDN once per (scenario, pass); BDN spawns one child process per `Profile` value. |
+| `compute-pkrange-percentiles.ps1`| Aggregator: demultiplexes per-pass CSV by `Param_Profile`, computes per-pass Avg/Min/Max/P50…P99.9, renders `avg [min..max]` cells. |
 
 ## Prerequisites
 
 - Windows PowerShell 5.1+ or PowerShell 7+
 - .NET 8 SDK (the wrapper sets `DOTNET_ROLL_FORWARD=LatestMajor`)
-- Repo cloned and on `feature/msdata-direct-pkrange-lookup-optimization` (or descendant)
+- Repo cloned on `feature/msdata-direct-pkrange-lookup-optimization` (or descendant)
 
-## Variants benchmarked
+## Profiles benchmarked
 
-The variant token is set via `COSMOS_PKRANGE_VARIANT` (consumed by
-`FastPathVariantSelector`). The bypass flag is set via
-`COSMOS_PKRANGE_BYPASS_STRING_EPK` (consumed by `AddressResolver` to skip the
-upstream `string` allocation when feeding the EPK to the routing map).
+The benchmark `Profile` axis (`[Params]` on `DirectModeRoutingBenchmark` and
+`DirectModeRoutingRawDsrBenchmark`) names a `(variant, bypass)` tuple that
+`RoutingBenchmarkProfiles.Apply` translates to:
 
-| Label                  | Variant         | Bypass | Notes |
+- `FastPathVariantSelector.ActiveVariant` (which fast-path strategy)
+- `AddressResolver.UseStringEpkBypass` (skip producer-side string allocation)
+
+| Profile                | Variant         | Bypass | Notes |
 | ---------------------- | --------------- | ------ | ----- |
-| `string`               | `string`        | false  | baseline (legacy `SortedList`) |
-| `uint128`              | `uint128`       | false  | UInt128 numeric fast-path (V2 hash only) |
-| `bytespan-seq`         | `bytespan-seq`  | false  | byte-span sequential compare |
-| `bytespan-hand`        | `bytespan-hand` | false  | byte-span hand-unrolled compare |
-| `bytespan-hand-bypass` | `bytespan-hand` | true   | hand-unrolled + skip string→EPK conversion (PR #9 winner) |
-| `radix1`               | `radix1`        | true   | 1-byte radix index |
-| `radix2`               | `radix2`        | true   | 2-byte radix index |
-| `soa`                  | `soa`           | true   | struct-of-arrays + bypass |
-| `string-soa`           | `string-soa`    | false  | string-keyed SoA (works on V1 / hierarchical too) |
-| `cache-last`           | `cache-last`    | true   | wraps an inner strategy with a single-slot last-hit cache |
+| `string`               | `String`        | false  | baseline (legacy `SortedList`) |
+| `uint128`              | `UInt128`       | false  | UInt128 numeric fast-path (V2 hash only) |
+| `bytespan-seq`         | `BytespanSeq`   | false  | byte-span sequential compare |
+| `bytespan-hand`        | `BytespanHand`  | false  | byte-span hand-unrolled compare |
+| `bytespan-hand-bypass` | `BytespanHand`  | true   | hand-unrolled + skip string→EPK conversion (PR #9 winner) |
+| `radix1`               | `Radix1`        | true   | 1-byte radix index |
+| `radix2`               | `Radix2`        | true   | 2-byte radix index |
+| `soa`                  | `Soa`           | true   | struct-of-arrays + bypass |
+| `string-soa`           | `StringSoa`     | false  | string-keyed SoA (works on V1/hierarchical too) |
+| `cache-last`           | `CacheLast`     | true   | wraps an inner strategy with a single-slot last-hit cache |
 
-> Numeric strategies (everything except `string` and `string-soa`) require V2-hash
-> 32-char hex range boundaries. The factory falls back to `StringStrategy` on
-> non-V2 topologies. `string-soa` is exempted so it can run on any topology.
-
-Each label spawns a fresh `dotnet` child process — BDN best practice for variant
-isolation, accurate per-strategy memory accounting, and to defeat tiered-JIT
-cross-contamination.
+> Numeric strategies require V2-hash 32-char hex range boundaries. The factory
+> falls back to `StringStrategy` on non-V2 topologies. `StringSoa` is exempted.
 
 ## Scenarios
 
@@ -89,18 +86,19 @@ Parameters:
 
 ```
 bench-out\pkrange\
-├── summary.txt                          # final per-pass aggregate table
-├── summary.csv                          # same, machine-readable
+├── summary.txt                     # final per-pass aggregate table
+├── summary.csv                     # same, machine-readable
 ├── container\
-│   ├── p1-string.csv                    # raw measurements, label=string, pass 1
-│   ├── p1-string.log                    # full BDN console output
-│   ├── p1-string-artifacts\             # full BDN artifact dir
-│   ├── p1-uint128.csv … p1-cache-last.csv
-│   ├── p2-…
-│   └── p3-…
+│   ├── p1.csv                      # all-profiles measurements, pass 1
+│   ├── p1.log                      # full BDN console output
+│   ├── p1-artifacts\               # full BDN artifact dir
+│   ├── p2.csv  p2.log  p2-artifacts\
+│   └── p3.csv  p3.log  p3-artifacts\
 └── rawdsr\
     └── … (same structure)
 ```
+
+The aggregator demultiplexes each pass CSV by the `Param_Profile` column.
 
 ## Reading the report
 
@@ -133,22 +131,20 @@ Single-shot benchmark runs hide ±2–5% across-process drift on Windows
 (thermal, scheduler, JIT tier-0 → tier-1, OS noise). Running each variant 3×
 in alternating order across separate processes separates signal from drift.
 
-The inner loop is `variant`, the outer loop is `pass`, so the timeline is
-`v1 v2 … v10 v1 v2 … v10 v1 v2 … v10` — each variant's three runs are
-separated by all the others (no back-to-back same-variant runs).
+BDN's `[Params]` mechanism cycles profiles in alpha order within each pass,
+spawning one child process per profile value. Running 3 passes therefore
+produces three interleaved measurements per profile across separate processes.
 
-## Manual single-variant run
-
-If you want BDN's built-in markdown table for one variant:
+## Manual single-profile run
 
 ```powershell
-$env:COSMOS_PKRANGE_VARIANT           = 'soa'
-$env:COSMOS_PKRANGE_BYPASS_STRING_EPK = 'true'
+# Pin to one Profile via BDN's --filter glob (matches param values)
 dotnet Microsoft.Azure.Cosmos\tests\Microsoft.Azure.Cosmos.Performance.Tests\bin\Release\net8.0\Microsoft.Azure.Cosmos.Performance.Tests.dll `
-    --filter '*DirectModeRoutingBenchmark*'
+    --filter '*DirectModeRoutingBenchmark*' --runtimes net8.0
 ```
 
-The markdown table lands in `BenchmarkDotNet.Artifacts\results\*.md`.
+(omit `--filter` to run both benchmarks; BDN will spawn one child process per
+`Profile` value automatically.)
 
 ## Parametric range-count microbenchmark
 

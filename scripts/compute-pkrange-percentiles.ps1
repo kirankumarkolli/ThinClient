@@ -1,25 +1,16 @@
-# Compute per-(scenario, variant) percentiles by computing each metric per-pass
-# and aggregating across passes (avg / min / max in one cell). Works on the CSV
-# layout produced by run-pkrange-sweep.ps1: $Root\<scenario>\p<N>-<label>.csv.
+# Aggregate routing-benchmark sweep output into a per-(scenario, profile) table.
 #
-# Each metric cell renders as "avg [min..max]" across passes — exposes both
-# central tendency and pass-to-pass drift in a single column.
+# Layout produced by run-pkrange-sweep.ps1:
+#   $Root\<scenario>\p<N>.csv      # one CSV per pass; rows tagged with Param_Profile
+#
+# Each metric (Avg / Min / Max / P50 / P90 / P95 / P99 / P99.9) is computed
+# per pass and then aggregated across passes; cells render as "avg [min..max]"
+# in microseconds, exposing pass-to-pass drift inline.
 
 [CmdletBinding()]
 param(
     [string]$Root = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'bench-out\pkrange'),
-
-    # Override if you swept a different variant set.
-    [string[]]$Variants = @(
-        'string', 'uint128',
-        'bytespan-seq', 'bytespan-hand', 'bytespan-hand-bypass',
-        'radix1', 'radix2',
-        'soa', 'string-soa', 'cache-last'
-    ),
-
     [string[]]$Scenarios = @('rawdsr', 'container'),
-
-    # Variant used as 100% baseline in the delta table.
     [string]$Baseline = 'string'
 )
 
@@ -39,43 +30,49 @@ function Format-AggCell {
     $avg = ($values | Measure-Object -Average).Average
     $mn  = ($values | Measure-Object -Minimum).Minimum
     $mx  = ($values | Measure-Object -Maximum).Maximum
-    if ($values.Length -eq 1) {
-        return ('{0:F{1}}' -f $avg, $digits)
-    }
+    if ($values.Length -eq 1) { return ('{0:F{1}}' -f $avg, $digits) }
     return ('{0:F{2}} [{1:F{2}}..{3:F{2}}]' -f $avg, $mn, $digits, $mx)
 }
 
-# Collect samples per (scenario, variant, pass) ------------------------------
-# $bag[$scenario][$variant] = array of arrays — one inner array per pass.
+# Collect samples per (scenario, profile, pass) ------------------------------
+# $bag[$scenario][$profile] = array of arrays — one inner array of sorted samples per pass.
 $bag = @{}
 foreach ($scenario in $Scenarios) {
     $bag[$scenario] = @{}
     $scenarioDir = Join-Path $Root $scenario
-    if (-not (Test-Path $scenarioDir)) { continue }
+    if (-not (Test-Path $scenarioDir)) { Write-Warning "missing: $scenarioDir"; continue }
 
-    foreach ($v in $Variants) {
-        $perPass = @()
-        $pass = 1
-        while ($true) {
-            $csv = Join-Path $scenarioDir "p$pass-$v.csv"
-            if (-not (Test-Path $csv)) { break }
-            $samples = New-Object System.Collections.Generic.List[double]
-            foreach ($row in (Import-Csv $csv)) {
-                if ($row.Measurement_IterationStage -ne 'Result') { continue }
-                if ($row.Measurement_IterationMode -ne 'Workload' -and
-                    $row.Measurement_IterationMode -ne 'Actual') { continue }
-                $ns  = [double]$row.Measurement_Nanoseconds
-                $ops = [double]$row.Measurement_Operations
-                if ($ops -gt 0) { $samples.Add($ns / $ops / 1000.0) } # microseconds
+    $passFiles = Get-ChildItem -Path $scenarioDir -Filter 'p*.csv' -ErrorAction SilentlyContinue |
+                 Where-Object { $_.BaseName -match '^p\d+$' } |
+                 Sort-Object { [int]($_.BaseName.Substring(1)) }
+
+    foreach ($file in $passFiles) {
+        # Group rows by profile within this pass.
+        $perProfileSamples = @{}
+        foreach ($row in (Import-Csv $file.FullName)) {
+            if ($row.Measurement_IterationStage -ne 'Result') { continue }
+            if ($row.Measurement_IterationMode -ne 'Workload' -and
+                $row.Measurement_IterationMode -ne 'Actual') { continue }
+            $profile = $row.Param_Profile
+            if (-not $profile) { continue }
+            $ns  = [double]$row.Measurement_Nanoseconds
+            $ops = [double]$row.Measurement_Operations
+            if ($ops -le 0) { continue }
+            if (-not $perProfileSamples.ContainsKey($profile)) {
+                $perProfileSamples[$profile] = New-Object System.Collections.Generic.List[double]
             }
-            if ($samples.Count -gt 0) { $perPass += ,($samples.ToArray() | Sort-Object) }
-            $pass++
+            $perProfileSamples[$profile].Add($ns / $ops / 1000.0) # microseconds
         }
-        $bag[$scenario][$v] = $perPass
+        foreach ($profile in $perProfileSamples.Keys) {
+            if (-not $bag[$scenario].ContainsKey($profile)) {
+                $bag[$scenario][$profile] = @()
+            }
+            $bag[$scenario][$profile] += ,($perProfileSamples[$profile].ToArray() | Sort-Object)
+        }
     }
 }
 
-# Compute per-pass metrics ---------------------------------------------------
+# Compute per-pass metrics and aggregate ------------------------------------
 $metrics = [ordered]@{
     Avg  = { param($s) ($s | Measure-Object -Average).Average }
     Min  = { param($s) $s[0] }
@@ -89,12 +86,14 @@ $metrics = [ordered]@{
 
 $rows = @()
 foreach ($scenario in $Scenarios) {
-    foreach ($v in $Variants) {
-        $passes = $bag[$scenario][$v]
+    if (-not $bag.ContainsKey($scenario)) { continue }
+    $profiles = $bag[$scenario].Keys | Sort-Object
+    foreach ($p in $profiles) {
+        $passes = $bag[$scenario][$p]
         if (-not $passes -or $passes.Count -eq 0) { continue }
         $row = [ordered]@{
             Scenario = $scenario
-            Variant  = $v
+            Profile  = $p
             Passes   = $passes.Count
             N        = ($passes | ForEach-Object { $_.Length } | Measure-Object -Sum).Sum
         }
@@ -106,17 +105,13 @@ foreach ($scenario in $Scenarios) {
     }
 }
 
-# Render summary -------------------------------------------------------------
-if ($rows.Count -eq 0) {
-    Write-Warning "No data found under $Root"
-    return
-}
+if ($rows.Count -eq 0) { Write-Warning "No data found under $Root"; return }
 
 $rows | Format-Table -AutoSize | Out-String | Write-Host
 $rows | Format-Table -AutoSize | Out-File (Join-Path $Root 'summary.txt') -Encoding utf8
 $rows | Export-Csv -NoTypeInformation -Path (Join-Path $Root 'summary.csv')
 
-# Delta table — Avg vs Baseline ---------------------------------------------
+# Delta vs baseline ----------------------------------------------------------
 function Get-AvgFromCell {
     param([string]$cell)
     if ([string]::IsNullOrWhiteSpace($cell) -or $cell -eq '-') { return $null }
@@ -125,19 +120,17 @@ function Get-AvgFromCell {
 }
 
 foreach ($scenario in $Scenarios) {
-    $base = $rows | Where-Object { $_.Scenario -eq $scenario -and $_.Variant -eq $Baseline }
+    $base = $rows | Where-Object { $_.Scenario -eq $scenario -and $_.Profile -eq $Baseline }
     if (-not $base) { continue }
     Write-Host "`n=== $scenario : Avg delta vs '$Baseline' baseline (negative = faster) ===" -ForegroundColor Cyan
-    foreach ($v in $Variants) {
-        if ($v -eq $Baseline) { continue }
-        $r = $rows | Where-Object { $_.Scenario -eq $scenario -and $_.Variant -eq $v }
-        if (-not $r) { continue }
+    foreach ($r in ($rows | Where-Object { $_.Scenario -eq $scenario })) {
+        if ($r.Profile -eq $Baseline) { continue }
         $deltas = foreach ($m in 'Avg','P50','P90','P99','P999') {
             $b = Get-AvgFromCell $base.$m
             $c = Get-AvgFromCell $r.$m
             if ($b -and $b -gt 0 -and $c) { '{0,7:F2}%' -f ((($c - $b) / $b) * 100) } else { '   n/a ' }
         }
-        Write-Host ("  {0,-22}  Avg={1}  P50={2}  P90={3}  P99={4}  P99.9={5}" -f $v, $deltas[0], $deltas[1], $deltas[2], $deltas[3], $deltas[4])
+        Write-Host ("  {0,-22}  Avg={1}  P50={2}  P90={3}  P99={4}  P99.9={5}" -f $r.Profile, $deltas[0], $deltas[1], $deltas[2], $deltas[3], $deltas[4])
     }
 }
 
