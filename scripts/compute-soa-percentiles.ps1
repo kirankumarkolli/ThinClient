@@ -17,7 +17,7 @@ function Get-Percentile {
     return $sorted[$lo] * (1 - $frac) + $sorted[$hi] * $frac
 }
 
-$variants = @('A','B','C','D','F','G')
+$variants = @('A','B','C','D','F','G','H')
 $scenarios = @('rawdsr','container')
 $results = @()
 

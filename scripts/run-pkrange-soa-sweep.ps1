@@ -20,7 +20,8 @@ $variants = @(
     @{ Label = 'C'; Variant = 'bytespan-seq';  Bypass = 'false' },
     @{ Label = 'D'; Variant = 'bytespan-hand'; Bypass = 'false' },
     @{ Label = 'F'; Variant = 'bytespan-hand'; Bypass = 'true'  },
-    @{ Label = 'G'; Variant = 'soa';           Bypass = 'true'  }
+    @{ Label = 'G'; Variant = 'soa';           Bypass = 'true'  },
+    @{ Label = 'H'; Variant = 'string-soa';    Bypass = 'false' }
 )
 
 $scenarios = @(
