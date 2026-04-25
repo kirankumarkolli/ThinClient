@@ -12,6 +12,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
     using BenchmarkDotNet.Attributes;
     using Microsoft.Azure.Cosmos.Performance.Tests.Data;
     using Microsoft.Azure.Cosmos.Performance.Tests.Mocks;
+    using Microsoft.Azure.Cosmos.Routing;
     using Microsoft.Azure.Documents;
     /// <summary>
     /// End-to-end Direct-mode point-read benchmark that exercises the real production SDK
@@ -46,9 +47,27 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
         private DirectStubTransport transport;
         private string[] pkPool;
 
+        // Variant selector wired into BDN. Each [Params] value spawns a fresh child process
+        // (separate GlobalSetup / CosmosClient), keeping the comparison clean. Values match
+        // CollectionRoutingMap's COSMOS_PKRANGE_VARIANT env var names.
+        [Params("string", "uint128", "bytespan-seq", "bytespan-hand", "radix1", "radix2", "cache-last")]
+        public string Variant { get; set; }
+
         [GlobalSetup]
         public void GlobalSetup()
         {
+            Environment.SetEnvironmentVariable("COSMOS_PKRANGE_VARIANT", this.Variant);
+            CollectionRoutingMap.ActiveVariant = this.Variant switch
+            {
+                "string" => CollectionRoutingMap.FastPathVariant.String,
+                "uint128" => CollectionRoutingMap.FastPathVariant.UInt128,
+                "bytespan-seq" => CollectionRoutingMap.FastPathVariant.BytespanSeq,
+                "bytespan-hand" => CollectionRoutingMap.FastPathVariant.BytespanHand,
+                "radix1" => CollectionRoutingMap.FastPathVariant.Radix1,
+                "radix2" => CollectionRoutingMap.FastPathVariant.Radix2,
+                "cache-last" => CollectionRoutingMap.FastPathVariant.CacheLast,
+                _ => CollectionRoutingMap.FastPathVariant.UInt128,
+            };
             // MockRequestHelper's static ctor reads samplepayload.json from CWD;
             // under BenchmarkDotNet the working directory points at the host project, so
             // re-anchor it at the benchmark assembly's output directory before anything
