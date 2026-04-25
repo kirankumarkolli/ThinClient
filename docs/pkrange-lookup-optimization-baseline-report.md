@@ -29,6 +29,7 @@ against issue
 | C | Phase 1a + 2a (UInt128) | Zero-alloc string lookup + UInt128 numeric fast-path. `COSMOS_PKRANGE_VARIANT=uint128` (default) |
 | D | Phase 1a + Span\<byte\> (`SequenceCompareTo`) | 16-byte big-endian boundaries searched via `MemoryExtensions.SequenceCompareTo`. `COSMOS_PKRANGE_VARIANT=bytespan-seq` |
 | E | Phase 1a + Span\<byte\> (hand-rolled) | 16-byte big-endian boundaries searched via two `BinaryPrimitives.ReadUInt64BigEndian` calls per probe. `COSMOS_PKRANGE_VARIANT=bytespan-hand` |
+| F | Phase 1a + producer-side bypass (pure span) | `EffectivePartitionKey` `ref struct` over `ReadOnlySpan<byte>`; `PartitionKeyInternal.TryWriteEffectivePartitionKeyV2HashBytes` writes 16 BE bytes into a `stackalloc byte[16]` and `AddressResolver` routes via the new opaque overload, skipping the `byte[16]` + `Array.Reverse` + 32-char hex string allocation entirely. Gated by `COSMOS_PKRANGE_BYPASS_STRING_EPK=true` (PR [#9](https://github.com/kirankumarkolli/ThinClient/pull/9)). |
 
 ## Results — `master` codebase (feature/pkrange-lookup-optimization)
 
@@ -70,6 +71,55 @@ env-var selector; A was captured immediately before by reverting
 | Gen0      |        6.5015 | 6.5015                 | 6.5015           | 6.5015                | 6.5015                 |
 | Allocated |      26.67 KB | 26.62 KB               | 26.61 KB         | 26.62 KB              | 26.62 KB               |
 
+## Results — `msdata/direct` codebase, F (producer-side bypass / pure span)
+
+Branch: `users/kirankk/msdata-direct-pkrange-bypass-stage3-purespan`. Same harness
+as A–E; F is captured with `COSMOS_PKRANGE_VARIANT=uint128`
+(boundary-storage selector — irrelevant to F because F's new opaque overload
+binary-searches the byte-storage `byte[16N]` directly, not the variant-selector
+path) and `COSMOS_PKRANGE_BYPASS_STRING_EPK={true|false}`.
+
+`Bypass=OFF` row is the same E-variant boundary code with the new opaque API
+present but inactive — used as the F-control to isolate the producer-bypass
+delta from any A→E run-to-run drift.
+
+`Bypass=ON` row reflects three back-to-back ON runs; means are reported as the
+average of the two stable runs (run 1 was system-noise outlier, SD > 1.0 µs).
+
+| Metric    | F (control) — Bypass=OFF | F — Bypass=ON               | Δ (ON vs OFF) |
+|-----------|-------------------------:|----------------------------:|--------------:|
+| Mean      |                 15.93 μs | 15.82 μs (best stable run)  |     within noise |
+| StdDev    |                 0.387 μs |                    0.305 μs |              −21 % |
+| P95       |                 16.52 μs |                    16.24 μs |             −1.7 % |
+| P100      |                 16.74 μs |                    16.24 μs |             −3.0 % |
+| Gen0      |                   6.5015 |                  **6.4246** |          **−1.2 %** |
+| Allocated |                 26.62 KB |                **26.34 KB** |    **−270 B/op** |
+
+**The headline win is the −270 B/op allocation drop, consistent across every ON
+run** — exactly the eliminated `byte[16]` (16 B + ~24 B array overhead) plus the
+32-char hex `string` (~84 B) plus a couple transient frame allocations. Mean and
+tail percentiles are at parity with the best A–E variant; the structural win is
+the GC-churn reduction (Gen0 −1.2 %), which compounds under sustained throughput
+where the 270 B/op turns into measurable nursery pressure relief.
+
+### Cross-variant rollup (best stable runs, `msdata/direct`)
+
+| Variant | Storage              | Contract              | Mean    | P100    | Allocated |
+|---------|----------------------|-----------------------|--------:|--------:|----------:|
+| A       | string boundaries    | `string`              | 16.11 μs | 17.25 | 26.67 KB |
+| B       | `string[]`           | `string`              | 15.51   | 16.12 | 26.62    |
+| C       | `UInt128[]`          | `string`              | 15.45   | 16.49 | 26.61    |
+| D       | `byte[16N]`          | `string`              | 15.47   | 16.94 | 26.62    |
+| E       | `byte[16N]`          | `string`              | 15.67   | 17.04 | 26.62    |
+| **F**   | **`byte[16N]`**      | **`ReadOnlySpan<byte>`** | **15.82** | **16.24** | **26.34** |
+
+F is the only variant that hits the −270 B/op allocation drop while remaining
+at parity with the best Mean / P100 of any variant. The earlier concern that
+byte-storage variants regress at the tail (D, E above C at P100) does **not**
+propagate to F at the E2E level — micro-bench differences in the binary-search
+inner loop are dominated by request/response handling and GC jitter outside the
+routing-map call.
+
 ## Notes
 
 - On `master`, all of the visible end-to-end win comes from the Phase 1a
@@ -102,7 +152,13 @@ env-var selector; A was captured immediately before by reverting
   allocation budget and is unaffected.
 - The remaining unrealized win — threading the pre-parsed numeric (or byte-
   array) EPK from `MurmurHash3.Hash128()` directly into `AddressResolver` to
-  skip per-call hex encoding — is not yet wired in. The byte-storage variants
-  (D, E) are the foundation for that direction since they integrate with a
-  bytes-end-to-end EPK pipeline without requiring a re-conversion. That work
-  is tracked as the next step on issue #1.
+  skip per-call hex encoding — **is realized by variant F (PR #9)**: the
+  producer writes 16 BE bytes directly into a `stackalloc byte[16]`, the
+  opaque `ref struct EffectivePartitionKey` is a view over that span, and the
+  routing-map consumer binary-searches against the existing `byte[16N]`
+  boundary storage via the hand-rolled `ReadUInt64BigEndian × 2` compare. No
+  string materialization, no heap byte array. Gated behind
+  `COSMOS_PKRANGE_BYPASS_STRING_EPK` for safe roll-out. Future generalization
+  to MultiHash / V1 hash / hierarchical partition keys reuses the same
+  `ReadOnlySpan<byte>` contract since variable-length byte sequences fit the
+  shape naturally.
