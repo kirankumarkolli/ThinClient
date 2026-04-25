@@ -644,5 +644,373 @@ namespace Microsoft.Azure.Cosmos.Tests
             // Invalid: non-hex char
             Assert.IsFalse(CollectionRoutingMap.TryParseHex32ToUInt128("0000000000000000000000000000000G", out _));
         }
+
+        [TestMethod]
+        public void TestVariantEquivalence_AllVariantsAgreeOnRandomEpks()
+        {
+            // Build a V2-hash routing map with N evenly-spaced 128-bit boundaries
+            // and assert every FastPathVariant resolves the same range id for the
+            // same EPK input. Catches Layer 1 (payload SoA) regressions where the
+            // sortedRangePayloads array could fall out of sync with orderedPartitionKeyRanges,
+            // and locks behavior for subsequent layers (branchless search, prefetch).
+
+            const int rangeCount = 64;
+            CollectionRoutingMap routingMap = BuildV2HashRoutingMap(rangeCount, seed: 0xC051);
+
+            const int sampleCount = 5_000;
+            string[] epks = GenerateRandomHex32Epks(sampleCount, seed: 0xBEEF);
+
+            // Capture the baseline (string variant) once.
+            CollectionRoutingMap.FastPathVariant savedVariant = CollectionRoutingMap.ActiveVariant;
+            try
+            {
+                CollectionRoutingMap.ActiveVariant = CollectionRoutingMap.FastPathVariant.String;
+                string[] baseline = new string[sampleCount];
+                for (int i = 0; i < sampleCount; i++)
+                {
+                    baseline[i] = routingMap.GetRangeByEffectivePartitionKey(epks[i]).Id;
+                }
+
+                foreach (CollectionRoutingMap.FastPathVariant variant in new[]
+                {
+                    CollectionRoutingMap.FastPathVariant.UInt128,
+                    CollectionRoutingMap.FastPathVariant.BytespanSeq,
+                    CollectionRoutingMap.FastPathVariant.BytespanHand,
+                    CollectionRoutingMap.FastPathVariant.Soa,
+                })
+                {
+                    CollectionRoutingMap.ActiveVariant = variant;
+                    for (int i = 0; i < sampleCount; i++)
+                    {
+                        string actual = routingMap.GetRangeByEffectivePartitionKey(epks[i]).Id;
+                        Assert.AreEqual(
+                            baseline[i],
+                            actual,
+                            $"Variant {variant} disagreed with String baseline on EPK {epks[i]} (sample {i}).");
+                    }
+                }
+            }
+            finally
+            {
+                CollectionRoutingMap.ActiveVariant = savedVariant;
+            }
+        }
+
+        [TestMethod]
+        public void TestGetOverlappingRangesByBytes_MatchesStringPath()
+        {
+            const int rangeCount = 64;
+            CollectionRoutingMap routingMap = BuildV2HashRoutingMap(rangeCount, seed: 0xC051);
+
+            // 100 random [min, max) sub-ranges, each of length up to ~1/16 of the total
+            // 128-bit space, so we hit small / medium / large overlap counts.
+            const int sampleCount = 100;
+            Random rng = new Random(0xFEED);
+            for (int s = 0; s < sampleCount; s++)
+            {
+                byte[] minBytes = new byte[16];
+                byte[] maxBytes = new byte[16];
+                rng.NextBytes(minBytes);
+                rng.NextBytes(maxBytes);
+                if (minBytes[0] == 0xFF) minBytes[0] = 0xFE;
+                if (maxBytes[0] == 0xFF) maxBytes[0] = 0xFE;
+                if (CompareBE(minBytes, maxBytes) > 0)
+                {
+                    byte[] tmp = minBytes; minBytes = maxBytes; maxBytes = tmp;
+                }
+                else if (CompareBE(minBytes, maxBytes) == 0)
+                {
+                    maxBytes[15] = (byte)(maxBytes[15] ^ 0x01);
+                    if (CompareBE(minBytes, maxBytes) > 0)
+                    {
+                        byte[] tmp = minBytes; minBytes = maxBytes; maxBytes = tmp;
+                    }
+                }
+
+                string minHex = ToHex32(minBytes);
+                string maxHex = ToHex32(maxBytes);
+
+                IReadOnlyList<PartitionKeyRange> stringResult =
+                    routingMap.GetOverlappingRanges(new Range<string>(minHex, maxHex, isMinInclusive: true, isMaxInclusive: false));
+                IReadOnlyList<PartitionKeyRange> bytesResult =
+                    routingMap.GetOverlappingRangesByBytes(minBytes, maxBytes);
+
+                HashSet<string> stringIds = new HashSet<string>(stringResult.Select(r => r.Id));
+                HashSet<string> bytesIds = new HashSet<string>(bytesResult.Select(r => r.Id));
+                CollectionAssert.AreEquivalent(
+                    stringIds.ToList(),
+                    bytesIds.ToList(),
+                    $"Sample {s}: GetOverlappingRangesByBytes diverged from GetOverlappingRanges.\n" +
+                    $"  min = {minHex}\n  max = {maxHex}\n" +
+                    $"  string = [{string.Join(",", stringIds)}]\n  bytes  = [{string.Join(",", bytesIds)}]");
+            }
+        }
+
+        private static int CompareBE(byte[] a, byte[] b)
+        {
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (a[i] != b[i])
+                {
+                    return a[i] < b[i] ? -1 : 1;
+                }
+            }
+            return 0;
+        }
+
+        /// <summary>
+        /// Verifies that the SoA fast-path correctly reflects the post-split topology
+        /// after <see cref="CollectionRoutingMap.TryCombine"/> rebuilds the map. PKRanges
+        /// are dynamic at runtime (splits / merges); the routing map is immutable per
+        /// snapshot but a topology change triggers a full reconstruction. Variant G's
+        /// parallel arrays (sortedByteBoundaries / sortedRangePayloads / sortedMaxBytes)
+        /// must be regenerated from scratch on every reconstruction.
+        /// </summary>
+        [TestMethod]
+        public void TestSoaFastPath_AfterSplit_ReflectsNewTopology()
+        {
+            // Start with a 4-range V2-hash map.
+            CollectionRoutingMap original = BuildV2HashRoutingMap(rangeCount: 4, seed: 0xA110);
+            Assert.AreEqual(4, original.OrderedPartitionKeyRanges.Count);
+
+            // Pick the second range (id "1") and split it in half on a new V2-hash boundary
+            // halfway between its [Min, Max). The split children get parents=["1"] so the
+            // parent goes into goneRanges of the rebuilt map.
+            PartitionKeyRange parent = original.OrderedPartitionKeyRanges
+                .First(r => r.Id == "1");
+            string splitBoundary = MidpointHex32(parent.MinInclusive, parent.MaxExclusive);
+
+            CollectionRoutingMap splitMap = original.TryCombine(
+                new[]
+                {
+                    Tuple.Create(
+                        new PartitionKeyRange
+                        {
+                            Id = "100",
+                            Parents = new System.Collections.ObjectModel.Collection<string> { "1" },
+                            MinInclusive = parent.MinInclusive,
+                            MaxExclusive = splitBoundary,
+                        },
+                        (ServiceIdentity)null),
+                    Tuple.Create(
+                        new PartitionKeyRange
+                        {
+                            Id = "101",
+                            Parents = new System.Collections.ObjectModel.Collection<string> { "1" },
+                            MinInclusive = splitBoundary,
+                            MaxExclusive = parent.MaxExclusive,
+                        },
+                        (ServiceIdentity)null),
+                },
+                changeFeedNextIfNoneMatch: string.Empty,
+                useLengthAwareComparer: false);
+
+            Assert.IsNotNull(splitMap, "TryCombine must succeed for a clean parent->children split.");
+            Assert.AreEqual(5, splitMap.OrderedPartitionKeyRanges.Count, "Parent should be replaced by two children -> 4 - 1 + 2 = 5 ranges.");
+            Assert.IsTrue(splitMap.IsGone("1"), "Original parent id should be in goneRanges of the rebuilt map.");
+
+            // Cross-variant equivalence on the post-split map. If the SoA arrays were
+            // not rebuilt, variant G would still resolve EPKs that fall in the parent's
+            // range to the OLD parent payload, while string / uint128 / bytespan-* would
+            // resolve to one of the NEW children. So an equivalence sweep across all
+            // variants on the post-split map is a precise dynamism check.
+            string[] epks = GenerateRandomHex32Epks(count: 2_000, seed: 0xB22B);
+
+            string original_env = Environment.GetEnvironmentVariable("COSMOS_PKRANGE_VARIANT");
+            CollectionRoutingMap.FastPathVariant savedVariant = CollectionRoutingMap.ActiveVariant;
+            try
+            {
+                string[] firstResults = null;
+                CollectionRoutingMap.FastPathVariant firstVariant = default;
+                bool firstSet = false;
+
+                foreach (CollectionRoutingMap.FastPathVariant variant in new[]
+                {
+                    CollectionRoutingMap.FastPathVariant.String,
+                    CollectionRoutingMap.FastPathVariant.UInt128,
+                    CollectionRoutingMap.FastPathVariant.BytespanSeq,
+                    CollectionRoutingMap.FastPathVariant.BytespanHand,
+                    CollectionRoutingMap.FastPathVariant.Soa,
+                })
+                {
+                    CollectionRoutingMap.ActiveVariant = variant;
+
+                    string[] hits = epks.Select(epk => splitMap.GetRangeByEffectivePartitionKey(epk).Id).ToArray();
+
+                    if (!firstSet)
+                    {
+                        firstResults = hits;
+                        firstVariant = variant;
+                        firstSet = true;
+                    }
+                    else
+                    {
+                        for (int i = 0; i < hits.Length; i++)
+                        {
+                            if (hits[i] != firstResults[i])
+                            {
+                                Assert.Fail(
+                                    $"Variant '{variant}' diverged from '{firstVariant}' on EPK {epks[i]} after split: " +
+                                    $"got id={hits[i]}, expected id={firstResults[i]}. " +
+                                    "SoA arrays were not rebuilt to reflect the post-split topology.");
+                            }
+                        }
+                    }
+
+                    // Sanity-check: none of the hits should be the goneRanges parent.
+                    Assert.IsFalse(hits.Contains("1"), $"Variant '{variant}' returned the gone parent range id '1'.");
+                }
+            }
+            finally
+            {
+                CollectionRoutingMap.ActiveVariant = savedVariant;
+                Environment.SetEnvironmentVariable("COSMOS_PKRANGE_VARIANT", original_env);
+            }
+        }
+
+        private static string MidpointHex32(string minHex, string maxHex)
+        {
+            // Compute an interior 32-char hex boundary strictly between minHex and maxHex
+            // (treating both as 128-bit big-endian unsigned integers). Handles the
+            // empty-min sentinel ("" = 0) and the all-FF max sentinel ("FF" => 1<<128).
+            byte[] minBytes = HexToBytesOrZero(minHex);
+            byte[] maxBytes = HexToBytesOrAllFF(maxHex);
+
+            // mid = min + (max - min) / 2, computed byte-wise with carry.
+            byte[] mid = new byte[16];
+            int borrow = 0;
+            byte[] diff = new byte[16];
+            for (int i = 15; i >= 0; i--)
+            {
+                int d = maxBytes[i] - minBytes[i] - borrow;
+                if (d < 0) { d += 256; borrow = 1; } else { borrow = 0; }
+                diff[i] = (byte)d;
+            }
+            // diff /= 2 (right shift by 1)
+            int carry = 0;
+            for (int i = 0; i < 16; i++)
+            {
+                int v = (carry << 8) | diff[i];
+                diff[i] = (byte)(v >> 1);
+                carry = v & 1;
+            }
+            // mid = min + diff
+            int add = 0;
+            for (int i = 15; i >= 0; i--)
+            {
+                int s = minBytes[i] + diff[i] + add;
+                mid[i] = (byte)(s & 0xFF);
+                add = s >> 8;
+            }
+
+            return ToHex32(mid);
+        }
+
+        private static byte[] HexToBytesOrZero(string hex)
+        {
+            byte[] bytes = new byte[16];
+            if (string.IsNullOrEmpty(hex))
+            {
+                return bytes;
+            }
+            for (int i = 0; i < 16; i++)
+            {
+                bytes[i] = (byte)((HexNibble(hex[i * 2]) << 4) | HexNibble(hex[(i * 2) + 1]));
+            }
+            return bytes;
+        }
+
+        private static byte[] HexToBytesOrAllFF(string hex)
+        {
+            if (hex == "FF")
+            {
+                byte[] bytes = new byte[16];
+                for (int i = 0; i < 16; i++) bytes[i] = 0xFF;
+                return bytes;
+            }
+            return HexToBytesOrZero(hex);
+        }
+
+        private static int HexNibble(char c)
+        {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return 0;
+        }
+
+        private static CollectionRoutingMap BuildV2HashRoutingMap(int rangeCount, int seed)
+        {
+            // Generate rangeCount-1 evenly-spaced random 128-bit boundaries, build
+            // ranges [0,b0), [b0,b1), ..., [bN-2,FF].
+            Random rng = new Random(seed);
+            byte[] bytes = new byte[16];
+            string[] boundaries = new string[rangeCount - 1];
+            for (int i = 0; i < rangeCount - 1; i++)
+            {
+                rng.NextBytes(bytes);
+                if (bytes[0] == 0xFF)
+                {
+                    bytes[0] = 0xFE;
+                }
+                boundaries[i] = ToHex32(bytes);
+            }
+            Array.Sort(boundaries, StringComparer.Ordinal);
+
+            List<Tuple<PartitionKeyRange, ServiceIdentity>> ranges =
+                new List<Tuple<PartitionKeyRange, ServiceIdentity>>(rangeCount);
+
+            for (int i = 0; i < rangeCount; i++)
+            {
+                string min = i == 0 ? string.Empty : boundaries[i - 1];
+                string max = i == rangeCount - 1 ? "FF" : boundaries[i];
+                ranges.Add(Tuple.Create(
+                    new PartitionKeyRange { Id = i.ToString(), MinInclusive = min, MaxExclusive = max },
+                    (ServiceIdentity)null));
+            }
+
+            CollectionRoutingMap routingMap = CollectionRoutingMap.TryCreateCompleteRoutingMap(
+                ranges,
+                string.Empty,
+                false);
+            Assert.IsNotNull(routingMap);
+            return routingMap;
+        }
+
+        private static string[] GenerateRandomHex32Epks(int count, int seed)
+        {
+            // PartitionKeyInternal.MaximumExclusiveEffectivePartitionKey is the literal "FF",
+            // and GetRangeByEffectivePartitionKey throws when the input compares >= "FF"
+            // ordinally. Any 32-char hex EPK starting with "FF" sorts strictly after "FF"
+            // (shorter-prefix-sorts-first), so we cap the leading byte to 0xFE to keep
+            // every generated sample inside the addressable range.
+            Random rng = new Random(seed);
+            byte[] bytes = new byte[16];
+            string[] result = new string[count];
+            for (int i = 0; i < count; i++)
+            {
+                rng.NextBytes(bytes);
+                if (bytes[0] == 0xFF)
+                {
+                    bytes[0] = 0xFE;
+                }
+                result[i] = ToHex32(bytes);
+            }
+            return result;
+        }
+
+        private static string ToHex32(byte[] bytes)
+        {
+            char[] chars = new char[32];
+            for (int i = 0; i < 16; i++)
+            {
+                byte b = bytes[i];
+                chars[i * 2] = HexChar(b >> 4);
+                chars[i * 2 + 1] = HexChar(b & 0x0F);
+            }
+            return new string(chars);
+        }
+
+        private static char HexChar(int nibble) => (char)(nibble < 10 ? '0' + nibble : 'A' + (nibble - 10));
     }
 }
