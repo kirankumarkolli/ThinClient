@@ -5,6 +5,7 @@
 namespace Microsoft.Azure.Cosmos.Routing
 {
     using System;
+    using System.Buffers.Binary;
     using System.Collections.Generic;
     using System.Collections.ObjectModel;
     using System.Diagnostics;
@@ -30,7 +31,40 @@ namespace Microsoft.Azure.Cosmos.Routing
         private readonly List<Range<string>> orderedRanges;
         private readonly string[] sortedMinBoundaries;
         private readonly UInt128[] sortedNumericBoundaries;
+        private readonly byte[] sortedByteBoundaries; // flat: 16 bytes per range, big-endian
         private readonly bool hasNumericFastPath;
+
+        /// <summary>
+        /// Experimental variant selector for benchmarking the routing-map point lookup.
+        /// Controlled by env var COSMOS_PKRANGE_VARIANT:
+        ///   "string"     => Phase 1a only (string Array.BinarySearch)
+        ///   "uint128"    => Phase 1a + UInt128 fast path  (default)
+        ///   "bytespan-seq"  => Phase 1a + byte[16N] with SequenceCompareTo
+        ///   "bytespan-hand" => Phase 1a + byte[16N] with hand-rolled ReadUInt64BE compare
+        /// </summary>
+        internal enum FastPathVariant
+        {
+            String,
+            UInt128,
+            BytespanSeq,
+            BytespanHand,
+        }
+
+        internal static FastPathVariant ActiveVariant { get; set; } =
+            ParseVariant(Environment.GetEnvironmentVariable("COSMOS_PKRANGE_VARIANT"));
+
+        private static FastPathVariant ParseVariant(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return FastPathVariant.UInt128;
+            switch (s.Trim().ToLowerInvariant())
+            {
+                case "string": return FastPathVariant.String;
+                case "uint128": return FastPathVariant.UInt128;
+                case "bytespan-seq": return FastPathVariant.BytespanSeq;
+                case "bytespan-hand": return FastPathVariant.BytespanHand;
+                default: return FastPathVariant.UInt128;
+            }
+        }
         private readonly HashSet<string> goneRanges;
         private readonly static int InvalidPkRangeId = -1;
 
@@ -86,6 +120,24 @@ namespace Microsoft.Azure.Cosmos.Routing
 
             this.sortedNumericBoundaries = allParsed ? numericBoundaries : null;
             this.hasNumericFastPath = allParsed;
+
+            // Build parallel byte[] representation (16 bytes per boundary, big-endian).
+            // Used when UseByteSpanFastPath is set — kept alongside UInt128 path for A/B benchmarking.
+            if (allParsed)
+            {
+                byte[] byteBoundaries = new byte[orderedPartitionKeyRanges.Count * 16];
+                for (int i = 0; i < orderedPartitionKeyRanges.Count; i++)
+                {
+                    string min = this.sortedMinBoundaries[i];
+                    if (min.Length != 0)
+                    {
+                        CollectionRoutingMap.WriteHex32ToBytes(min, byteBoundaries, i * 16);
+                    }
+                    // empty min -> all zeros (already default)
+                }
+
+                this.sortedByteBoundaries = byteBoundaries;
+            }
 
             this.CollectionUniqueId = collectionUniqueId;
             this.ChangeFeedNextIfNoneMatch = changeFeedNextIfNoneMatch;
@@ -210,8 +262,47 @@ namespace Microsoft.Azure.Cosmos.Routing
                 return this.orderedPartitionKeyRanges[0];
             }
 
-            // Numeric fast path: UInt128 comparison (2 ulongs) instead of 32-char string ordinal.
-            if (this.hasNumericFastPath
+            FastPathVariant variant = CollectionRoutingMap.ActiveVariant;
+
+            // Span<byte> fast path with SequenceCompareTo (D).
+            if (variant == FastPathVariant.BytespanSeq
+                && this.hasNumericFastPath
+                && effectivePartitionKeyValue.Length == 32)
+            {
+                Span<byte> epkBytes = stackalloc byte[16];
+                if (CollectionRoutingMap.TryParseHex32ToBytes(effectivePartitionKeyValue, epkBytes))
+                {
+                    int index = CollectionRoutingMap.BinarySearchBytesSeq(this.sortedByteBoundaries, epkBytes);
+                    if (index < 0)
+                    {
+                        index = ~index - 1;
+                    }
+
+                    return this.orderedPartitionKeyRanges[index];
+                }
+            }
+
+            // Span<byte> fast path with hand-rolled ReadUInt64BE compare (E).
+            if (variant == FastPathVariant.BytespanHand
+                && this.hasNumericFastPath
+                && effectivePartitionKeyValue.Length == 32)
+            {
+                Span<byte> epkBytes = stackalloc byte[16];
+                if (CollectionRoutingMap.TryParseHex32ToBytes(effectivePartitionKeyValue, epkBytes))
+                {
+                    int index = CollectionRoutingMap.BinarySearchBytes(this.sortedByteBoundaries, epkBytes);
+                    if (index < 0)
+                    {
+                        index = ~index - 1;
+                    }
+
+                    return this.orderedPartitionKeyRanges[index];
+                }
+            }
+
+            // Numeric fast path: UInt128 comparison (C).
+            if (variant == FastPathVariant.UInt128
+                && this.hasNumericFastPath
                 && CollectionRoutingMap.TryParseHex32ToUInt128(effectivePartitionKeyValue, out UInt128 numericEpk))
             {
                 int index = Array.BinarySearch(
@@ -226,7 +317,7 @@ namespace Microsoft.Azure.Cosmos.Routing
                 return this.orderedPartitionKeyRanges[index];
             }
 
-            // String fallback for non-128-bit-hex EPKs (V1, range, hierarchical PK).
+            // String fallback / Phase 1a only (B).
             int idx = Array.BinarySearch(
                 this.sortedMinBoundaries,
                 effectivePartitionKeyValue,
@@ -419,6 +510,124 @@ namespace Microsoft.Azure.Cosmos.Routing
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Parses a 32-char hex string into a 16-byte big-endian span. Returns false on bad input.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool TryParseHex32ToBytes(string hex, Span<byte> destination)
+        {
+            if (hex.Length != 32 || destination.Length < 16)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < 16; i++)
+            {
+                int hi = CollectionRoutingMap.HexCharToNibble(hex[2 * i]);
+                int lo = CollectionRoutingMap.HexCharToNibble(hex[(2 * i) + 1]);
+                if ((hi | lo) < 0)
+                {
+                    return false;
+                }
+
+                destination[i] = (byte)((hi << 4) | lo);
+            }
+
+            return true;
+        }
+
+        private static void WriteHex32ToBytes(string hex, byte[] dest, int offset)
+        {
+            for (int i = 0; i < 16; i++)
+            {
+                int hi = CollectionRoutingMap.HexCharToNibble(hex[2 * i]);
+                int lo = CollectionRoutingMap.HexCharToNibble(hex[(2 * i) + 1]);
+                dest[offset + i] = (byte)((hi << 4) | lo);
+            }
+        }
+
+        /// <summary>
+        /// Binary-searches a flat byte[] of 16-byte big-endian boundaries for the given key.
+        /// Returns the index (or bitwise-complement of insertion point), matching Array.BinarySearch semantics.
+        /// </summary>
+        /// <summary>
+        /// Variant D: SequenceCompareTo-based binary search.
+        /// </summary>
+        private static int BinarySearchBytesSeq(byte[] boundaries, ReadOnlySpan<byte> key)
+        {
+            int lo = 0;
+            int hi = (boundaries.Length / 16) - 1;
+            ReadOnlySpan<byte> all = boundaries;
+            while (lo <= hi)
+            {
+                int mid = lo + ((hi - lo) >> 1);
+                int cmp = all.Slice(mid * 16, 16).SequenceCompareTo(key);
+                if (cmp == 0)
+                {
+                    return mid;
+                }
+                else if (cmp < 0)
+                {
+                    lo = mid + 1;
+                }
+                else
+                {
+                    hi = mid - 1;
+                }
+            }
+
+            return ~lo;
+        }
+
+        /// <summary>
+        /// Variant E: hand-rolled binary search using two big-endian ulong reads per probe.
+        /// </summary>
+        private static int BinarySearchBytes(byte[] boundaries, ReadOnlySpan<byte> key)
+        {
+            // Key is exactly 16 bytes big-endian; read it once outside the loop.
+            ulong keyHi = BinaryPrimitives.ReadUInt64BigEndian(key);
+            ulong keyLo = BinaryPrimitives.ReadUInt64BigEndian(key.Slice(8));
+
+            int lo = 0;
+            int hi = (boundaries.Length / 16) - 1;
+            ReadOnlySpan<byte> all = boundaries;
+            while (lo <= hi)
+            {
+                int mid = lo + ((hi - lo) >> 1);
+                ReadOnlySpan<byte> midSpan = all.Slice(mid * 16, 16);
+                ulong midHi = BinaryPrimitives.ReadUInt64BigEndian(midSpan);
+                if (midHi != keyHi)
+                {
+                    if (midHi < keyHi)
+                    {
+                        lo = mid + 1;
+                    }
+                    else
+                    {
+                        hi = mid - 1;
+                    }
+
+                    continue;
+                }
+
+                ulong midLo = BinaryPrimitives.ReadUInt64BigEndian(midSpan.Slice(8));
+                if (midLo == keyLo)
+                {
+                    return mid;
+                }
+                else if (midLo < keyLo)
+                {
+                    lo = mid + 1;
+                }
+                else
+                {
+                    hi = mid - 1;
+                }
+            }
+
+            return ~lo;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
