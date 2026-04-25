@@ -35,15 +35,15 @@ $allScenarios = @(
     @{ Name = 'rawdsr';    Filter = '*DirectModeRoutingRawDsrBenchmark*' },
     @{ Name = 'container'; Filter = '*DirectModeRoutingBenchmark.ReadItemStream*' }
 )
-$scenarios = $allScenarios | Where-Object { $Scenarios -contains $_.Name }
-if (-not $scenarios) { throw "No matching scenarios in: $($Scenarios -join ',')" }
+$matchedScenarios = @($allScenarios | Where-Object { $Scenarios -contains $_.Name })
+if (-not $matchedScenarios) { throw "No matching scenarios in: $($Scenarios -join ',')" }
 
 $projectDir = Join-Path $RepoRoot 'Microsoft.Azure.Cosmos\tests\Microsoft.Azure.Cosmos.Performance.Tests'
 $dllPath    = Join-Path $projectDir 'bin\Release\net8.0\Microsoft.Azure.Cosmos.Performance.Tests.dll'
 
 $env:DOTNET_ROLL_FORWARD = 'LatestMajor'
 
-foreach ($scenario in $scenarios) {
+foreach ($scenario in $matchedScenarios) {
     $scenarioOut = Join-Path $OutDir $scenario.Name
     New-Item -ItemType Directory -Force -Path $scenarioOut | Out-Null
 
@@ -60,7 +60,7 @@ foreach ($scenario in $scenarios) {
             New-Item -ItemType Directory -Force -Path $artifactsDir | Out-Null
 
             $logFile = Join-Path $scenarioOut "p$pass-$label.log"
-            & dotnet $dllPath --filter $scenario.Filter --artifacts $artifactsDir 2>&1 | Tee-Object -FilePath $logFile | Out-Null
+            & dotnet $dllPath --filter $($scenario.Filter) --artifacts $artifactsDir 2>&1 | Tee-Object -FilePath $logFile | Out-Null
 
             $csvHit = Get-ChildItem -Path $artifactsDir -Recurse -Filter '*-measurements.csv' -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($csvHit) {
