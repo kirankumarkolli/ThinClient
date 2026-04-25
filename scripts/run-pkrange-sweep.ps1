@@ -7,27 +7,36 @@
 
 [CmdletBinding()]
 param(
-    [string]$OutDir = "$env:USERPROFILE\.copilot\session-state\7ef9d8fb-011b-4dab-b259-eb24685997e2\files\measurements\soa",
-    [string]$RepoRoot = "C:\src\v31-msdata-port"
+    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
+    [string]$OutDir   = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'bench-out\pkrange'),
+    [int]$Passes      = 3,
+    [string[]]$Scenarios = @('rawdsr', 'container')
 )
 
 $ErrorActionPreference = 'Continue'
 Set-Location $RepoRoot
 
+# Variant token = COSMOS_PKRANGE_VARIANT value; output files named after Label.
+# Labels avoid characters that would be awkward in file names.
 $variants = @(
-    @{ Label = 'A'; Variant = 'string';        Bypass = 'false' },
-    @{ Label = 'B'; Variant = 'uint128';       Bypass = 'false' },
-    @{ Label = 'C'; Variant = 'bytespan-seq';  Bypass = 'false' },
-    @{ Label = 'D'; Variant = 'bytespan-hand'; Bypass = 'false' },
-    @{ Label = 'F'; Variant = 'bytespan-hand'; Bypass = 'true'  },
-    @{ Label = 'G'; Variant = 'soa';           Bypass = 'true'  },
-    @{ Label = 'H'; Variant = 'string-soa';    Bypass = 'false' }
+    @{ Label = 'string';               Variant = 'string';        Bypass = 'false' },
+    @{ Label = 'uint128';              Variant = 'uint128';       Bypass = 'false' },
+    @{ Label = 'bytespan-seq';         Variant = 'bytespan-seq';  Bypass = 'false' },
+    @{ Label = 'bytespan-hand';        Variant = 'bytespan-hand'; Bypass = 'false' },
+    @{ Label = 'bytespan-hand-bypass'; Variant = 'bytespan-hand'; Bypass = 'true'  },
+    @{ Label = 'radix1';               Variant = 'radix1';        Bypass = 'true'  },
+    @{ Label = 'radix2';               Variant = 'radix2';        Bypass = 'true'  },
+    @{ Label = 'soa';                  Variant = 'soa';           Bypass = 'true'  },
+    @{ Label = 'string-soa';           Variant = 'string-soa';    Bypass = 'false' },
+    @{ Label = 'cache-last';           Variant = 'cache-last';    Bypass = 'true'  }
 )
 
-$scenarios = @(
+$allScenarios = @(
     @{ Name = 'rawdsr';    Filter = '*DirectModeRoutingRawDsrBenchmark*' },
     @{ Name = 'container'; Filter = '*DirectModeRoutingBenchmark.ReadItemStream*' }
 )
+$scenarios = $allScenarios | Where-Object { $Scenarios -contains $_.Name }
+if (-not $scenarios) { throw "No matching scenarios in: $($Scenarios -join ',')" }
 
 $projectDir = Join-Path $RepoRoot 'Microsoft.Azure.Cosmos\tests\Microsoft.Azure.Cosmos.Performance.Tests'
 $dllPath    = Join-Path $projectDir 'bin\Release\net8.0\Microsoft.Azure.Cosmos.Performance.Tests.dll'
@@ -38,7 +47,7 @@ foreach ($scenario in $scenarios) {
     $scenarioOut = Join-Path $OutDir $scenario.Name
     New-Item -ItemType Directory -Force -Path $scenarioOut | Out-Null
 
-    for ($pass = 1; $pass -le 3; $pass++) {
+    for ($pass = 1; $pass -le $Passes; $pass++) {
         foreach ($v in $variants) {
             $label = $v.Label
             $stamp = Get-Date -Format 'HH:mm:ss'
