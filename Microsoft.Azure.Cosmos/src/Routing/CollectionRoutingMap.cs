@@ -70,6 +70,11 @@ namespace Microsoft.Azure.Cosmos.Routing
         ///   "cache-last"      => UInt128 + last-resolved-index cache fast path
         ///   "soa"             => bytespan-hand + payload SoA (parallel arrays, no List indirection)
         ///                        + branchless binary search + gated software prefetch.
+        ///   "string-soa"      => string Array.BinarySearch comparison + payload SoA + branchless
+        ///                        string binary search. Targets V1 hash / hierarchical PK /
+        ///                        variable-length-EPK collections that cannot use the V2 byte
+        ///                        fast path. Same SoA bookkeeping as variant G but keeps
+        ///                        string.CompareOrdinal as the per-probe comparator.
         /// </summary>
         internal enum FastPathVariant
         {
@@ -81,6 +86,7 @@ namespace Microsoft.Azure.Cosmos.Routing
             Radix2,
             CacheLast,
             Soa,
+            StringSoa,
         }
 
         internal static FastPathVariant ActiveVariant { get; set; } =
@@ -99,6 +105,7 @@ namespace Microsoft.Azure.Cosmos.Routing
                 case "radix2": return FastPathVariant.Radix2;
                 case "cache-last": return FastPathVariant.CacheLast;
                 case "soa": return FastPathVariant.Soa;
+                case "string-soa": return FastPathVariant.StringSoa;
                 default: return FastPathVariant.UInt128;
             }
         }
@@ -158,26 +165,13 @@ namespace Microsoft.Azure.Cosmos.Routing
             this.sortedNumericBoundaries = allParsed ? numericBoundaries : null;
             this.hasNumericFastPath = allParsed;
 
-            // Build parallel byte[] representation (16 bytes per boundary, big-endian).
-            // Used when UseByteSpanFastPath is set — kept alongside UInt128 path for A/B benchmarking.
-            if (allParsed)
+            // Layer 1 — Payload SoA. Built unconditionally (not gated on hasNumericFastPath)
+            // so the string path (variant H = StringSoa) and the byte path (variant G = Soa)
+            // both share the same parallel arrays. sortedRangePayloads is a plain T[] (no
+            // List<T>) so SoA hot paths return sortedRangePayloads[index] without the
+            // List indirection. orderedPartitionKeyRanges is retained because it backs
+            // the public OrderedPartitionKeyRanges IReadOnlyList<PartitionKeyRange> property.
             {
-                byte[] byteBoundaries = new byte[orderedPartitionKeyRanges.Count * 16];
-                for (int i = 0; i < orderedPartitionKeyRanges.Count; i++)
-                {
-                    string min = this.sortedMinBoundaries[i];
-                    if (min.Length != 0)
-                    {
-                        CollectionRoutingMap.WriteHex32ToBytes(min, byteBoundaries, i * 16);
-                    }
-                    // empty min -> all zeros (already default)
-                }
-
-                this.sortedByteBoundaries = byteBoundaries;
-
-                // Layer 1 — Payload SoA. Build parallel arrays of just-what-the-hot-path-needs.
-                // sortedRangePayloads is a plain T[] (no List<T>) so the variant-G hot path
-                // returns sortedRangePayloads[index] without the List indirection.
                 int n = orderedPartitionKeyRanges.Count;
                 PartitionKeyRange[] payloads = new PartitionKeyRange[n];
                 string[] rangeIds = new string[n];
@@ -196,6 +190,24 @@ namespace Microsoft.Azure.Cosmos.Routing
                 this.sortedRangePayloads = payloads;
                 this.sortedRangeIds = rangeIds;
                 this.sortedServiceIdentities = serviceIdentities;
+            }
+
+            // Build parallel byte[] representation (16 bytes per boundary, big-endian).
+            // V2-hash-only — gated on hasNumericFastPath since it requires 32-char hex Mins.
+            if (allParsed)
+            {
+                byte[] byteBoundaries = new byte[orderedPartitionKeyRanges.Count * 16];
+                for (int i = 0; i < orderedPartitionKeyRanges.Count; i++)
+                {
+                    string min = this.sortedMinBoundaries[i];
+                    if (min.Length != 0)
+                    {
+                        CollectionRoutingMap.WriteHex32ToBytes(min, byteBoundaries, i * 16);
+                    }
+                    // empty min -> all zeros (already default)
+                }
+
+                this.sortedByteBoundaries = byteBoundaries;
 
                 // Layer 3 — packed MaxExclusive boundaries for SoA GetOverlappingRangesByBytes.
                 // Mirrors sortedByteBoundaries but stores each range's MaxExclusive as 16 bytes
@@ -203,6 +215,7 @@ namespace Microsoft.Azure.Cosmos.Routing
                 // (PartitionKeyInternal.MaximumExclusiveEffectivePartitionKey) which is not
                 // a 32-char hex string; we encode it as all-0xFF to act as positive infinity
                 // for byte-wise compares.
+                int n = orderedPartitionKeyRanges.Count;
                 byte[] maxBytes = new byte[n * 16];
                 for (int i = 0; i < n; i++)
                 {
@@ -420,6 +433,67 @@ namespace Microsoft.Azure.Cosmos.Routing
             return new ReadOnlyCollection<PartitionKeyRange>(result);
         }
 
+        /// <summary>
+        /// Layer 3 (variant H) — SoA range query keyed by string Min boundaries. Mirrors
+        /// <see cref="GetOverlappingRangesByBytes"/> but uses
+        /// <see cref="BinarySearchStringsBranchless"/> + <see cref="sortedMinBoundaries"/>
+        /// so it works on any topology (V1 hash, V2 hash, hierarchical PK, variable-length
+        /// EPKs). Avoids the per-iteration <c>List&lt;Range&lt;string&gt;&gt;.BinarySearch</c>
+        /// + <c>IComparer</c> dispatch in the standard
+        /// <see cref="GetOverlappingRanges(Range{string})"/> overload.
+        ///
+        /// <paramref name="minInclusive"/> may be the empty string (denoting the
+        /// MinimumInclusive sentinel); <paramref name="maxExclusive"/> may be the literal
+        /// "FF" (denoting the MaximumExclusive sentinel) -- both are treated correctly by
+        /// ordinal compare given the boundaries array's natural ordering.
+        /// </summary>
+        public IReadOnlyList<PartitionKeyRange> GetOverlappingRangesByStrings(
+            string minInclusive,
+            string maxExclusive)
+        {
+            if (minInclusive == null) throw new ArgumentNullException(nameof(minInclusive));
+            if (maxExclusive == null) throw new ArgumentNullException(nameof(maxExclusive));
+            if (string.CompareOrdinal(minInclusive, maxExclusive) >= 0)
+            {
+                throw new ArgumentException("minInclusive must be strictly less than maxExclusive.");
+            }
+
+            int n = this.sortedMinBoundaries.Length;
+
+            int minIdx = ~CollectionRoutingMap.BinarySearchStringsBranchless(this.sortedMinBoundaries, minInclusive) - 1;
+            if (minIdx < 0)
+            {
+                minIdx = 0;
+            }
+
+            int maxIdx = ~CollectionRoutingMap.BinarySearchStringsBranchless(this.sortedMinBoundaries, maxExclusive) - 1;
+            if (maxIdx < 0)
+            {
+                maxIdx = 0;
+            }
+            else if (maxIdx >= n)
+            {
+                maxIdx = n - 1;
+            }
+            else if (maxIdx > minIdx
+                && string.CompareOrdinal(this.sortedMinBoundaries[maxIdx], maxExclusive) == 0)
+            {
+                // The range whose Min equals maxExclusive starts at the request's exclusive
+                // upper bound and therefore does not overlap.
+                maxIdx--;
+            }
+
+            int count = maxIdx - minIdx + 1;
+            if (count <= 0)
+            {
+                return Array.Empty<PartitionKeyRange>();
+            }
+
+            PartitionKeyRange[] result = new PartitionKeyRange[count];
+            Array.Copy(this.sortedRangePayloads, minIdx, result, 0, count);
+            return new ReadOnlyCollection<PartitionKeyRange>(result);
+        }
+
         public PartitionKeyRange GetRangeByEffectivePartitionKey(string effectivePartitionKeyValue)
         {
             if (string.CompareOrdinal(effectivePartitionKeyValue, PartitionKeyInternal.MaximumExclusiveEffectivePartitionKey) >= 0)
@@ -487,6 +561,22 @@ namespace Microsoft.Azure.Cosmos.Routing
 
                     return this.sortedRangePayloads[index];
                 }
+            }
+
+            // String-SoA fast path (H): string Array.BinarySearch comparator + payload SoA
+            // (no List<T> indirection) + branchless string binary search. Targets V1 hash /
+            // hierarchical PK / variable-length-EPK collections that cannot use the V2 byte
+            // fast path (G). Independent of hasNumericFastPath: works on any topology.
+            if (variant == FastPathVariant.StringSoa)
+            {
+                int index = CollectionRoutingMap.BinarySearchStringsBranchless(
+                    this.sortedMinBoundaries, effectivePartitionKeyValue);
+                if (index < 0)
+                {
+                    index = ~index - 1;
+                }
+
+                return this.sortedRangePayloads[index];
             }
 
             // Numeric fast path: UInt128 comparison (C).
@@ -1064,6 +1154,46 @@ namespace Microsoft.Azure.Cosmos.Routing
 
             // Always return ~lo. Caller does ~index - 1 → lo - 1, which is the largest
             // index with boundary <= key under the upper-bound semantics above.
+            return ~lo;
+        }
+
+        /// <summary>
+        /// Branchless binary search over the string Min boundaries. Variant H (StringSoa).
+        /// Mirrors <see cref="BinarySearchBytesBranchless"/> but probes via
+        /// <see cref="string.CompareOrdinal(string, string)"/> so it works on any boundary
+        /// representation -- V1 hash (10-char hex), V2 hash (32-char hex), or hierarchical /
+        /// variable-length EPK strings.
+        ///
+        /// Uses upper-bound semantics (<c>mid &lt;= key</c>) so the answer is uniformly
+        /// <c>lo - 1</c> regardless of whether an exact match exists, and the probe-direction
+        /// update is arithmetic-mask-driven so the JIT can lower it to cmov-style code.
+        /// Treats the empty string ("") as &lt; every non-empty string, matching the
+        /// MinimumInclusive sentinel ordering used by the caller.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int BinarySearchStringsBranchless(string[] boundaries, string key)
+        {
+            int lo = 0;
+            int hi = boundaries.Length - 1;
+
+            while (lo <= hi)
+            {
+                int mid = lo + ((hi - lo) >> 1);
+
+                // mid <= key under ordinal compare. boundaries[mid] is the Min boundary;
+                // CompareOrdinal returns < 0 when mid < key, 0 when equal, > 0 when mid > key.
+                bool midLeq = string.CompareOrdinal(boundaries[mid], key) <= 0;
+                int midLeqInt = System.Runtime.CompilerServices.Unsafe.As<bool, byte>(ref midLeq);
+
+                int mask = -midLeqInt;
+                int newLo = (mid + 1) & mask;
+                int newHi = (mid - 1) & ~mask;
+                int keepLo = lo & ~mask;
+                int keepHi = hi & mask;
+                lo = newLo | keepLo;
+                hi = newHi | keepHi;
+            }
+
             return ~lo;
         }
 
