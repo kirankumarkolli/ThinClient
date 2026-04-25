@@ -31,7 +31,8 @@ namespace Microsoft.Azure.Cosmos.Routing
         private readonly List<Range<string>> orderedRanges;
         private readonly string[] sortedMinBoundaries;
         private readonly UInt128[] sortedNumericBoundaries;
-        private readonly byte[] sortedByteBoundaries; // flat: 16 bytes per range, big-endian
+        private readonly byte[] sortedByteBoundaries; // flat: 16 bytes per range MIN (inclusive), big-endian
+        private readonly byte[] sortedMaxBytes;       // flat: 16 bytes per range MAX (exclusive), big-endian. Layer 3.
         private readonly bool hasNumericFastPath;
 
         // Radix index: bucketStart256[b] = first index in sortedNumericBoundaries whose top byte >= b.
@@ -41,6 +42,17 @@ namespace Microsoft.Azure.Cosmos.Routing
         // Radix index: bucketStart64K[b] = first index whose top 16 bits >= b.
         // Sentinel at [65536] = ranges.Count. Built only when hasNumericFastPath. ~256 KB per map.
         private readonly int[] bucketStart64K;
+
+        // Payload SoA (Layer 1, variant G).
+        // Parallel array of PartitionKeyRange references with the same ordering as
+        // sortedByteBoundaries and orderedPartitionKeyRanges. Reads in the V2-hash
+        // hot path go through this T[] (single bounds-checked index) instead of
+        // List<T>, avoiding the List indirection layer. orderedPartitionKeyRanges
+        // is retained because it backs the public OrderedPartitionKeyRanges
+        // IReadOnlyList<PartitionKeyRange> property.
+        private readonly PartitionKeyRange[] sortedRangePayloads;
+        private readonly string[] sortedRangeIds;
+        private readonly ServiceIdentity[] sortedServiceIdentities;
 
         // Last-resolved-index cache for the LastResolvedCache variant. Single int, racy reads OK
         // (worst case: cache miss leads to fallthrough to UInt128 binary search).
@@ -56,6 +68,8 @@ namespace Microsoft.Azure.Cosmos.Routing
         ///   "radix1"          => UInt128 + top-byte (256-bucket) radix dispatch
         ///   "radix2"          => UInt128 + top-16-bit (65536-bucket) radix dispatch
         ///   "cache-last"      => UInt128 + last-resolved-index cache fast path
+        ///   "soa"             => bytespan-hand + payload SoA (parallel arrays, no List indirection)
+        ///                        + branchless binary search + gated software prefetch.
         /// </summary>
         internal enum FastPathVariant
         {
@@ -66,6 +80,7 @@ namespace Microsoft.Azure.Cosmos.Routing
             Radix1,
             Radix2,
             CacheLast,
+            Soa,
         }
 
         internal static FastPathVariant ActiveVariant { get; set; } =
@@ -83,6 +98,7 @@ namespace Microsoft.Azure.Cosmos.Routing
                 case "radix1": return FastPathVariant.Radix1;
                 case "radix2": return FastPathVariant.Radix2;
                 case "cache-last": return FastPathVariant.CacheLast;
+                case "soa": return FastPathVariant.Soa;
                 default: return FastPathVariant.UInt128;
             }
         }
@@ -158,6 +174,55 @@ namespace Microsoft.Azure.Cosmos.Routing
                 }
 
                 this.sortedByteBoundaries = byteBoundaries;
+
+                // Layer 1 — Payload SoA. Build parallel arrays of just-what-the-hot-path-needs.
+                // sortedRangePayloads is a plain T[] (no List<T>) so the variant-G hot path
+                // returns sortedRangePayloads[index] without the List indirection.
+                int n = orderedPartitionKeyRanges.Count;
+                PartitionKeyRange[] payloads = new PartitionKeyRange[n];
+                string[] rangeIds = new string[n];
+                ServiceIdentity[] serviceIdentities = new ServiceIdentity[n];
+                for (int i = 0; i < n; i++)
+                {
+                    PartitionKeyRange pkr = orderedPartitionKeyRanges[i];
+                    payloads[i] = pkr;
+                    rangeIds[i] = pkr.Id;
+                    if (rangeById.TryGetValue(pkr.Id, out Tuple<PartitionKeyRange, ServiceIdentity> entry))
+                    {
+                        serviceIdentities[i] = entry.Item2;
+                    }
+                }
+
+                this.sortedRangePayloads = payloads;
+                this.sortedRangeIds = rangeIds;
+                this.sortedServiceIdentities = serviceIdentities;
+
+                // Layer 3 — packed MaxExclusive boundaries for SoA GetOverlappingRangesByBytes.
+                // Mirrors sortedByteBoundaries but stores each range's MaxExclusive as 16 bytes
+                // big-endian. The last range's MaxExclusive is the sentinel "FF"
+                // (PartitionKeyInternal.MaximumExclusiveEffectivePartitionKey) which is not
+                // a 32-char hex string; we encode it as all-0xFF to act as positive infinity
+                // for byte-wise compares.
+                byte[] maxBytes = new byte[n * 16];
+                for (int i = 0; i < n; i++)
+                {
+                    string max = orderedPartitionKeyRanges[i].MaxExclusive;
+                    if (max != null && max.Length == 32)
+                    {
+                        CollectionRoutingMap.WriteHex32ToBytes(max, maxBytes, i * 16);
+                    }
+                    else
+                    {
+                        // Sentinel for the trailing "FF" (MaximumExclusive). All-0xFF is the
+                        // greatest 16-byte big-endian value, preserving compare ordering.
+                        for (int j = 0; j < 16; j++)
+                        {
+                            maxBytes[(i * 16) + j] = 0xFF;
+                        }
+                    }
+                }
+
+                this.sortedMaxBytes = maxBytes;
             }
 
             // Radix indexes for Radix1/Radix2/CacheLast variants. Built only when numeric
@@ -282,6 +347,79 @@ namespace Microsoft.Azure.Cosmos.Routing
             return new ReadOnlyCollection<PartitionKeyRange>(partitionRanges.Values);
         }
 
+        /// <summary>
+        /// Layer 3 — SoA range query. Returns the contiguous block of partition key ranges
+        /// that overlap [<paramref name="minInclusive"/>, <paramref name="maxExclusive"/>).
+        /// Both inputs must be exactly 16 bytes big-endian (V2 hash EPK form). Only valid
+        /// when the numeric fast path is available — i.e. the collection's partition
+        /// boundaries are V2 128-bit hash. For V1 / hierarchical / variable-length EPKs,
+        /// callers must continue to use the string-based <see cref="GetOverlappingRanges(Range{string})"/>
+        /// overloads.
+        ///
+        /// This overload exists so internal call sites that already hold raw EPK bytes
+        /// (post-<see cref="EffectivePartitionKey"/> plumbing) can avoid the per-iteration
+        /// <c>List&lt;Range&lt;string&gt;&gt;.BinarySearch</c> + <c>IComparer</c> dispatch
+        /// in the standard overload — replacing it with two branchless byte binary searches
+        /// against the packed boundary arrays plus an array-index walk over the SoA payload.
+        /// </summary>
+        public IReadOnlyList<PartitionKeyRange> GetOverlappingRangesByBytes(
+            ReadOnlySpan<byte> minInclusive,
+            ReadOnlySpan<byte> maxExclusive)
+        {
+            if (!this.hasNumericFastPath)
+            {
+                throw new InvalidOperationException(
+                    "Numeric fast path is not available for this routing map. Use the string overload.");
+            }
+
+            if (minInclusive.Length != 16 || maxExclusive.Length != 16)
+            {
+                throw new ArgumentException("V2 hash EPK ranges must be exactly 16 bytes each.");
+            }
+
+            int n = this.sortedByteBoundaries.Length >> 4;
+
+            // minIdx = largest range index whose Min boundary is <= request.minInclusive.
+            // BinarySearchBytesBranchless returns ~lo with upper-bound semantics; ~ret - 1
+            // gives that "largest <= key" position.
+            int minIdx = ~CollectionRoutingMap.BinarySearchBytesBranchless(this.sortedByteBoundaries, minInclusive) - 1;
+            if (minIdx < 0)
+            {
+                minIdx = 0;
+            }
+
+            // maxIdx = largest range index whose Min boundary is <= request.maxExclusive,
+            // then trim by one if that range's Min equals request.maxExclusive (the range
+            // starts at the request's exclusive upper bound and therefore does not overlap).
+            int maxIdx = ~CollectionRoutingMap.BinarySearchBytesBranchless(this.sortedByteBoundaries, maxExclusive) - 1;
+            if (maxIdx < 0)
+            {
+                maxIdx = 0;
+            }
+            else if (maxIdx >= n)
+            {
+                maxIdx = n - 1;
+            }
+            else if (maxIdx > minIdx)
+            {
+                ReadOnlySpan<byte> minAtMaxIdx = new ReadOnlySpan<byte>(this.sortedByteBoundaries, maxIdx << 4, 16);
+                if (minAtMaxIdx.SequenceEqual(maxExclusive))
+                {
+                    maxIdx--;
+                }
+            }
+
+            int count = maxIdx - minIdx + 1;
+            if (count <= 0)
+            {
+                return Array.Empty<PartitionKeyRange>();
+            }
+
+            PartitionKeyRange[] result = new PartitionKeyRange[count];
+            Array.Copy(this.sortedRangePayloads, minIdx, result, 0, count);
+            return new ReadOnlyCollection<PartitionKeyRange>(result);
+        }
+
         public PartitionKeyRange GetRangeByEffectivePartitionKey(string effectivePartitionKeyValue)
         {
             if (string.CompareOrdinal(effectivePartitionKeyValue, PartitionKeyInternal.MaximumExclusiveEffectivePartitionKey) >= 0)
@@ -329,6 +467,25 @@ namespace Microsoft.Azure.Cosmos.Routing
                     }
 
                     return this.orderedPartitionKeyRanges[index];
+                }
+            }
+
+            // SoA fast path (G): bytespan-hand search + payload SoA (no List<T> indirection)
+            // + branchless binary search + gated software prefetch (Layers 1 + 2).
+            if (variant == FastPathVariant.Soa
+                && this.hasNumericFastPath
+                && effectivePartitionKeyValue.Length == 32)
+            {
+                Span<byte> epkBytes = stackalloc byte[16];
+                if (CollectionRoutingMap.TryParseHex32ToBytes(effectivePartitionKeyValue, epkBytes))
+                {
+                    int index = CollectionRoutingMap.BinarySearchBytesBranchless(this.sortedByteBoundaries, epkBytes);
+                    if (index < 0)
+                    {
+                        index = ~index - 1;
+                    }
+
+                    return this.sortedRangePayloads[index];
                 }
             }
 
@@ -467,13 +624,27 @@ namespace Microsoft.Azure.Cosmos.Routing
                 return this.orderedPartitionKeyRanges[0];
             }
 
-            int index = CollectionRoutingMap.BinarySearchBytes(this.sortedByteBoundaries, key);
-            if (index < 0)
+            // Variant-G: branchless binary search + gated prefetch + SoA payload.
+            if (CollectionRoutingMap.ActiveVariant == FastPathVariant.Soa)
             {
-                index = ~index - 1;
-            }
+                int index = CollectionRoutingMap.BinarySearchBytesBranchless(this.sortedByteBoundaries, key);
+                if (index < 0)
+                {
+                    index = ~index - 1;
+                }
 
-            return this.orderedPartitionKeyRanges[index];
+                return this.sortedRangePayloads[index];
+            }
+            else
+            {
+                int index = CollectionRoutingMap.BinarySearchBytes(this.sortedByteBoundaries, key);
+                if (index < 0)
+                {
+                    index = ~index - 1;
+                }
+
+                return this.orderedPartitionKeyRanges[index];
+            }
         }
 
         /// <summary>
@@ -834,6 +1005,65 @@ namespace Microsoft.Azure.Cosmos.Routing
                 }
             }
 
+            return ~lo;
+        }
+
+        /// <summary>
+        /// Branchless binary search over the packed 16-byte boundary array. Variant G.
+        /// Differences vs <see cref="BinarySearchBytes"/>:
+        ///   1. Uses upper-bound semantics (<c>mid &lt;= key</c>) instead of the existing
+        ///      <see cref="BinarySearchBytes"/>'s strict-less + equality-short-circuit form.
+        ///      With upper-bound semantics, the answer is uniformly <c>lo - 1</c> regardless
+        ///      of whether an exact match exists, so the loop body has no equality branch.
+        ///      The method always returns <c>~lo</c>; callers' standard
+        ///      <c>if (index &lt; 0) index = ~index - 1;</c> handling produces <c>lo - 1</c>,
+        ///      which is the largest boundary index &lt;= key (exact-match-or-not).
+        ///   2. The probe-direction update (lo / hi) uses arithmetic-mask selection so the
+        ///      JIT can lower it to cmov-style code, avoiding the ~50%-mispredict-rate branch
+        ///      on each iteration of the data-dependent probe direction.
+        ///
+        /// Software prefetch was evaluated but not enabled here because this assembly
+        /// targets netstandard2.0, which doesn't expose <c>System.Runtime.Intrinsics.X86.Sse</c>.
+        /// A conditionally-compiled prefetch path could be added if/when the project gets
+        /// a net6.0 (or later) TFM; the branchless update alone is the primary win.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int BinarySearchBytesBranchless(byte[] boundaries, ReadOnlySpan<byte> key)
+        {
+            // Key is exactly 16 bytes big-endian; read it once outside the loop.
+            ulong keyHi = BinaryPrimitives.ReadUInt64BigEndian(key);
+            ulong keyLo = BinaryPrimitives.ReadUInt64BigEndian(key.Slice(8));
+
+            int n = boundaries.Length >> 4;
+            int lo = 0;
+            int hi = n - 1;
+            ReadOnlySpan<byte> all = boundaries;
+
+            while (lo <= hi)
+            {
+                int mid = lo + ((hi - lo) >> 1);
+                int midOffset = mid << 4;
+
+                ulong midHi = BinaryPrimitives.ReadUInt64BigEndian(all.Slice(midOffset, 8));
+                ulong midLo = BinaryPrimitives.ReadUInt64BigEndian(all.Slice(midOffset + 8, 8));
+
+                // mid <= key  iff  midHi < keyHi  OR  (midHi == keyHi AND midLo <= keyLo).
+                // Upper-bound semantics: "advance lo past mid when boundary[mid] <= key".
+                bool midLeq = midHi < keyHi || (midHi == keyHi && midLo <= keyLo);
+                int midLeqInt = System.Runtime.CompilerServices.Unsafe.As<bool, byte>(ref midLeq);
+
+                // mask = -1 (all bits) when mid<=key, else 0. Branchless lo/hi update.
+                int mask = -midLeqInt;
+                int newLo = (mid + 1) & mask;
+                int newHi = (mid - 1) & ~mask;
+                int keepLo = lo & ~mask;
+                int keepHi = hi & mask;
+                lo = newLo | keepLo;
+                hi = newHi | keepHi;
+            }
+
+            // Always return ~lo. Caller does ~index - 1 → lo - 1, which is the largest
+            // index with boundary <= key under the upper-bound semantics above.
             return ~lo;
         }
 
