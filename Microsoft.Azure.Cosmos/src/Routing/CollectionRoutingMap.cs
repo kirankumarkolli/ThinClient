@@ -334,6 +334,52 @@ namespace Microsoft.Azure.Cosmos.Routing
         }
 
         /// <summary>
+        /// Point lookup using an opaque <see cref="EffectivePartitionKey"/> ref-struct over a
+        /// 16-byte big-endian buffer. Skips the 32-char hex string round-trip entirely and
+        /// runs the hand-rolled <see cref="BinarySearchBytes"/> compare against the byte-storage
+        /// boundary array. Only valid when the numeric fast path is active (128-bit hash V2
+        /// collections).
+        /// </summary>
+        public PartitionKeyRange GetRangeByEffectivePartitionKey(in EffectivePartitionKey effectivePartitionKey)
+        {
+            if (!this.hasNumericFastPath)
+            {
+                throw new InvalidOperationException(
+                    "Numeric fast path is not available for this routing map. Use the string overload.");
+            }
+
+            ReadOnlySpan<byte> key = effectivePartitionKey.AsSpan();
+            if (key.Length != 16)
+            {
+                throw new ArgumentException("V2 hash EPK must be exactly 16 bytes.", nameof(effectivePartitionKey));
+            }
+
+            // All-zero buffer maps to MinValue range — first range covers MinimumInclusive.
+            bool allZero = true;
+            for (int i = 0; i < 16; i++)
+            {
+                if (key[i] != 0)
+                {
+                    allZero = false;
+                    break;
+                }
+            }
+
+            if (allZero)
+            {
+                return this.orderedPartitionKeyRanges[0];
+            }
+
+            int index = CollectionRoutingMap.BinarySearchBytes(this.sortedByteBoundaries, key);
+            if (index < 0)
+            {
+                index = ~index - 1;
+            }
+
+            return this.orderedPartitionKeyRanges[index];
+        }
+
+        /// <summary>
         /// Point lookup using a pre-parsed UInt128 effective partition key.
         /// Skips hex parsing overhead — callers that already have numeric EPK values
         /// (e.g., from MurmurHash3.Hash128) should prefer this overload.

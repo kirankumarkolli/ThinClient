@@ -8,6 +8,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
     using BenchmarkDotNet.Columns;
     using BenchmarkDotNet.Configs;
     using BenchmarkDotNet.Diagnosers;
+    using BenchmarkDotNet.Exporters.Csv;
     using BenchmarkDotNet.Jobs;
     using Microsoft.Azure.Cosmos.Performance.Tests.Data;
 
@@ -39,9 +40,19 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
                 .WithUnrollFactor(1)
                 .WithInvocationCount(InvocationsPerIteration));
 
+            this.AddColumn(StatisticColumn.P0);
+            this.AddColumn(StatisticColumn.P25);
+            this.AddColumn(StatisticColumn.P50);
+            this.AddColumn(StatisticColumn.P67);
+            this.AddColumn(StatisticColumn.P80);
+            this.AddColumn(StatisticColumn.P85);
             this.AddColumn(StatisticColumn.P90);
             this.AddColumn(StatisticColumn.P95);
             this.AddColumn(StatisticColumn.P100);
+
+            // Raw per-iteration measurements so we can compute fine-grained percentiles
+            // (P99, P99.9 etc.) offline that BDN's StatisticColumn doesn't expose.
+            this.AddExporter(CsvMeasurementsExporter.Default);
         }
     }
 }
