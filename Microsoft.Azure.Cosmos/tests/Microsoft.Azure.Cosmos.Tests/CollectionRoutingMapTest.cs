@@ -696,6 +696,68 @@ namespace Microsoft.Azure.Cosmos.Tests
             }
         }
 
+        [TestMethod]
+        public void TestGetOverlappingRangesByBytes_MatchesStringPath()
+        {
+            const int rangeCount = 64;
+            CollectionRoutingMap routingMap = BuildV2HashRoutingMap(rangeCount, seed: 0xC051);
+
+            // 100 random [min, max) sub-ranges, each of length up to ~1/16 of the total
+            // 128-bit space, so we hit small / medium / large overlap counts.
+            const int sampleCount = 100;
+            Random rng = new Random(0xFEED);
+            for (int s = 0; s < sampleCount; s++)
+            {
+                byte[] minBytes = new byte[16];
+                byte[] maxBytes = new byte[16];
+                rng.NextBytes(minBytes);
+                rng.NextBytes(maxBytes);
+                if (minBytes[0] == 0xFF) minBytes[0] = 0xFE;
+                if (maxBytes[0] == 0xFF) maxBytes[0] = 0xFE;
+                if (CompareBE(minBytes, maxBytes) > 0)
+                {
+                    byte[] tmp = minBytes; minBytes = maxBytes; maxBytes = tmp;
+                }
+                else if (CompareBE(minBytes, maxBytes) == 0)
+                {
+                    maxBytes[15] = (byte)(maxBytes[15] ^ 0x01);
+                    if (CompareBE(minBytes, maxBytes) > 0)
+                    {
+                        byte[] tmp = minBytes; minBytes = maxBytes; maxBytes = tmp;
+                    }
+                }
+
+                string minHex = ToHex32(minBytes);
+                string maxHex = ToHex32(maxBytes);
+
+                IReadOnlyList<PartitionKeyRange> stringResult =
+                    routingMap.GetOverlappingRanges(new Range<string>(minHex, maxHex, isMinInclusive: true, isMaxInclusive: false));
+                IReadOnlyList<PartitionKeyRange> bytesResult =
+                    routingMap.GetOverlappingRangesByBytes(minBytes, maxBytes);
+
+                HashSet<string> stringIds = new HashSet<string>(stringResult.Select(r => r.Id));
+                HashSet<string> bytesIds = new HashSet<string>(bytesResult.Select(r => r.Id));
+                CollectionAssert.AreEquivalent(
+                    stringIds.ToList(),
+                    bytesIds.ToList(),
+                    $"Sample {s}: GetOverlappingRangesByBytes diverged from GetOverlappingRanges.\n" +
+                    $"  min = {minHex}\n  max = {maxHex}\n" +
+                    $"  string = [{string.Join(",", stringIds)}]\n  bytes  = [{string.Join(",", bytesIds)}]");
+            }
+        }
+
+        private static int CompareBE(byte[] a, byte[] b)
+        {
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (a[i] != b[i])
+                {
+                    return a[i] < b[i] ? -1 : 1;
+                }
+            }
+            return 0;
+        }
+
         private static CollectionRoutingMap BuildV2HashRoutingMap(int rangeCount, int seed)
         {
             // Generate rangeCount-1 evenly-spaced random 128-bit boundaries, build

@@ -31,7 +31,8 @@ namespace Microsoft.Azure.Cosmos.Routing
         private readonly List<Range<string>> orderedRanges;
         private readonly string[] sortedMinBoundaries;
         private readonly UInt128[] sortedNumericBoundaries;
-        private readonly byte[] sortedByteBoundaries; // flat: 16 bytes per range, big-endian
+        private readonly byte[] sortedByteBoundaries; // flat: 16 bytes per range MIN (inclusive), big-endian
+        private readonly byte[] sortedMaxBytes;       // flat: 16 bytes per range MAX (exclusive), big-endian. Layer 3.
         private readonly bool hasNumericFastPath;
 
         // Payload SoA (Layer 1, variant G).
@@ -174,6 +175,33 @@ namespace Microsoft.Azure.Cosmos.Routing
                 this.sortedRangePayloads = payloads;
                 this.sortedRangeIds = rangeIds;
                 this.sortedServiceIdentities = serviceIdentities;
+
+                // Layer 3 — packed MaxExclusive boundaries for SoA GetOverlappingRangesByBytes.
+                // Mirrors sortedByteBoundaries but stores each range's MaxExclusive as 16 bytes
+                // big-endian. The last range's MaxExclusive is the sentinel "FF"
+                // (PartitionKeyInternal.MaximumExclusiveEffectivePartitionKey) which is not
+                // a 32-char hex string; we encode it as all-0xFF to act as positive infinity
+                // for byte-wise compares.
+                byte[] maxBytes = new byte[n * 16];
+                for (int i = 0; i < n; i++)
+                {
+                    string max = orderedPartitionKeyRanges[i].MaxExclusive;
+                    if (max != null && max.Length == 32)
+                    {
+                        CollectionRoutingMap.WriteHex32ToBytes(max, maxBytes, i * 16);
+                    }
+                    else
+                    {
+                        // Sentinel for the trailing "FF" (MaximumExclusive). All-0xFF is the
+                        // greatest 16-byte big-endian value, preserving compare ordering.
+                        for (int j = 0; j < 16; j++)
+                        {
+                            maxBytes[(i * 16) + j] = 0xFF;
+                        }
+                    }
+                }
+
+                this.sortedMaxBytes = maxBytes;
             }
 
             this.CollectionUniqueId = collectionUniqueId;
@@ -285,6 +313,79 @@ namespace Microsoft.Azure.Cosmos.Routing
             }
 
             return new ReadOnlyCollection<PartitionKeyRange>(partitionRanges.Values);
+        }
+
+        /// <summary>
+        /// Layer 3 — SoA range query. Returns the contiguous block of partition key ranges
+        /// that overlap [<paramref name="minInclusive"/>, <paramref name="maxExclusive"/>).
+        /// Both inputs must be exactly 16 bytes big-endian (V2 hash EPK form). Only valid
+        /// when the numeric fast path is available — i.e. the collection's partition
+        /// boundaries are V2 128-bit hash. For V1 / hierarchical / variable-length EPKs,
+        /// callers must continue to use the string-based <see cref="GetOverlappingRanges(Range{string})"/>
+        /// overloads.
+        ///
+        /// This overload exists so internal call sites that already hold raw EPK bytes
+        /// (post-<see cref="EffectivePartitionKey"/> plumbing) can avoid the per-iteration
+        /// <c>List&lt;Range&lt;string&gt;&gt;.BinarySearch</c> + <c>IComparer</c> dispatch
+        /// in the standard overload — replacing it with two branchless byte binary searches
+        /// against the packed boundary arrays plus an array-index walk over the SoA payload.
+        /// </summary>
+        public IReadOnlyList<PartitionKeyRange> GetOverlappingRangesByBytes(
+            ReadOnlySpan<byte> minInclusive,
+            ReadOnlySpan<byte> maxExclusive)
+        {
+            if (!this.hasNumericFastPath)
+            {
+                throw new InvalidOperationException(
+                    "Numeric fast path is not available for this routing map. Use the string overload.");
+            }
+
+            if (minInclusive.Length != 16 || maxExclusive.Length != 16)
+            {
+                throw new ArgumentException("V2 hash EPK ranges must be exactly 16 bytes each.");
+            }
+
+            int n = this.sortedByteBoundaries.Length >> 4;
+
+            // minIdx = largest range index whose Min boundary is <= request.minInclusive.
+            // BinarySearchBytesBranchless returns ~lo with upper-bound semantics; ~ret - 1
+            // gives that "largest <= key" position.
+            int minIdx = ~CollectionRoutingMap.BinarySearchBytesBranchless(this.sortedByteBoundaries, minInclusive) - 1;
+            if (minIdx < 0)
+            {
+                minIdx = 0;
+            }
+
+            // maxIdx = largest range index whose Min boundary is <= request.maxExclusive,
+            // then trim by one if that range's Min equals request.maxExclusive (the range
+            // starts at the request's exclusive upper bound and therefore does not overlap).
+            int maxIdx = ~CollectionRoutingMap.BinarySearchBytesBranchless(this.sortedByteBoundaries, maxExclusive) - 1;
+            if (maxIdx < 0)
+            {
+                maxIdx = 0;
+            }
+            else if (maxIdx >= n)
+            {
+                maxIdx = n - 1;
+            }
+            else if (maxIdx > minIdx)
+            {
+                ReadOnlySpan<byte> minAtMaxIdx = new ReadOnlySpan<byte>(this.sortedByteBoundaries, maxIdx << 4, 16);
+                if (minAtMaxIdx.SequenceEqual(maxExclusive))
+                {
+                    maxIdx--;
+                }
+            }
+
+            int count = maxIdx - minIdx + 1;
+            if (count <= 0)
+            {
+                return Array.Empty<PartitionKeyRange>();
+            }
+
+            PartitionKeyRange[] result = new PartitionKeyRange[count];
+            Array.Copy(this.sortedRangePayloads, minIdx, result, 0, count);
+            return new ReadOnlyCollection<PartitionKeyRange>(result);
         }
 
         public PartitionKeyRange GetRangeByEffectivePartitionKey(string effectivePartitionKeyValue)
