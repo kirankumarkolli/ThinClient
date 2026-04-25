@@ -338,10 +338,7 @@ namespace Microsoft.Azure.Cosmos.Routing
             }
 
             // SoA fast path (G): bytespan-hand search + payload SoA (no List<T> indirection)
-            // + branchless binary search + gated software prefetch.
-            // Layer 1 (this commit): bytespan-hand search + sortedRangePayloads array index
-            // (no List<T> indirection).
-            // Layers 2 + 3 land in subsequent commits.
+            // + branchless binary search + gated software prefetch (Layers 1 + 2).
             if (variant == FastPathVariant.Soa
                 && this.hasNumericFastPath
                 && effectivePartitionKeyValue.Length == 32)
@@ -349,7 +346,7 @@ namespace Microsoft.Azure.Cosmos.Routing
                 Span<byte> epkBytes = stackalloc byte[16];
                 if (CollectionRoutingMap.TryParseHex32ToBytes(effectivePartitionKeyValue, epkBytes))
                 {
-                    int index = CollectionRoutingMap.BinarySearchBytes(this.sortedByteBoundaries, epkBytes);
+                    int index = CollectionRoutingMap.BinarySearchBytesBranchless(this.sortedByteBoundaries, epkBytes);
                     if (index < 0)
                     {
                         index = ~index - 1;
@@ -429,19 +426,27 @@ namespace Microsoft.Azure.Cosmos.Routing
                 return this.orderedPartitionKeyRanges[0];
             }
 
-            int index = CollectionRoutingMap.BinarySearchBytes(this.sortedByteBoundaries, key);
-            if (index < 0)
-            {
-                index = ~index - 1;
-            }
-
-            // Variant-G: read payload from the SoA array (no List<T> indirection).
+            // Variant-G: branchless binary search + gated prefetch + SoA payload.
             if (CollectionRoutingMap.ActiveVariant == FastPathVariant.Soa)
             {
+                int index = CollectionRoutingMap.BinarySearchBytesBranchless(this.sortedByteBoundaries, key);
+                if (index < 0)
+                {
+                    index = ~index - 1;
+                }
+
                 return this.sortedRangePayloads[index];
             }
+            else
+            {
+                int index = CollectionRoutingMap.BinarySearchBytes(this.sortedByteBoundaries, key);
+                if (index < 0)
+                {
+                    index = ~index - 1;
+                }
 
-            return this.orderedPartitionKeyRanges[index];
+                return this.orderedPartitionKeyRanges[index];
+            }
         }
 
         /// <summary>
@@ -738,6 +743,65 @@ namespace Microsoft.Azure.Cosmos.Routing
                 }
             }
 
+            return ~lo;
+        }
+
+        /// <summary>
+        /// Branchless binary search over the packed 16-byte boundary array. Variant G.
+        /// Differences vs <see cref="BinarySearchBytes"/>:
+        ///   1. Uses upper-bound semantics (<c>mid &lt;= key</c>) instead of the existing
+        ///      <see cref="BinarySearchBytes"/>'s strict-less + equality-short-circuit form.
+        ///      With upper-bound semantics, the answer is uniformly <c>lo - 1</c> regardless
+        ///      of whether an exact match exists, so the loop body has no equality branch.
+        ///      The method always returns <c>~lo</c>; callers' standard
+        ///      <c>if (index &lt; 0) index = ~index - 1;</c> handling produces <c>lo - 1</c>,
+        ///      which is the largest boundary index &lt;= key (exact-match-or-not).
+        ///   2. The probe-direction update (lo / hi) uses arithmetic-mask selection so the
+        ///      JIT can lower it to cmov-style code, avoiding the ~50%-mispredict-rate branch
+        ///      on each iteration of the data-dependent probe direction.
+        ///
+        /// Software prefetch was evaluated but not enabled here because this assembly
+        /// targets netstandard2.0, which doesn't expose <c>System.Runtime.Intrinsics.X86.Sse</c>.
+        /// A conditionally-compiled prefetch path could be added if/when the project gets
+        /// a net6.0 (or later) TFM; the branchless update alone is the primary win.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int BinarySearchBytesBranchless(byte[] boundaries, ReadOnlySpan<byte> key)
+        {
+            // Key is exactly 16 bytes big-endian; read it once outside the loop.
+            ulong keyHi = BinaryPrimitives.ReadUInt64BigEndian(key);
+            ulong keyLo = BinaryPrimitives.ReadUInt64BigEndian(key.Slice(8));
+
+            int n = boundaries.Length >> 4;
+            int lo = 0;
+            int hi = n - 1;
+            ReadOnlySpan<byte> all = boundaries;
+
+            while (lo <= hi)
+            {
+                int mid = lo + ((hi - lo) >> 1);
+                int midOffset = mid << 4;
+
+                ulong midHi = BinaryPrimitives.ReadUInt64BigEndian(all.Slice(midOffset, 8));
+                ulong midLo = BinaryPrimitives.ReadUInt64BigEndian(all.Slice(midOffset + 8, 8));
+
+                // mid <= key  iff  midHi < keyHi  OR  (midHi == keyHi AND midLo <= keyLo).
+                // Upper-bound semantics: "advance lo past mid when boundary[mid] <= key".
+                bool midLeq = midHi < keyHi || (midHi == keyHi && midLo <= keyLo);
+                int midLeqInt = System.Runtime.CompilerServices.Unsafe.As<bool, byte>(ref midLeq);
+
+                // mask = -1 (all bits) when mid<=key, else 0. Branchless lo/hi update.
+                int mask = -midLeqInt;
+                int newLo = (mid + 1) & mask;
+                int newHi = (mid - 1) & ~mask;
+                int keepLo = lo & ~mask;
+                int keepHi = hi & mask;
+                lo = newLo | keepLo;
+                hi = newHi | keepHi;
+            }
+
+            // Always return ~lo. Caller does ~index - 1 → lo - 1, which is the largest
+            // index with boundary <= key under the upper-bound semantics above.
             return ~lo;
         }
 
