@@ -696,27 +696,106 @@ namespace Microsoft.Azure.Documents.Routing
 
         private string GetEffectivePartitionKeyForHashPartitioningV2()
         {
-            byte[] hash = null;
+            UInt128 masked = this.GetEffectivePartitionKeyHashV2();
+            byte[] hash = UInt128.ToByteArray(masked);
+            Array.Reverse(hash);
+            return HexConvert.ToHex(hash, 0, hash.Length);
+        }
+
+        /// <summary>
+        /// Computes the effective partition key for V2 hash partitioning directly as a
+        /// <see cref="UInt128"/>, skipping the byte[16] + Array.Reverse + hex string round-trip
+        /// that <see cref="GetEffectivePartitionKeyForHashPartitioningV2"/> performs and that the
+        /// downstream router immediately undoes via hex-string parse.
+        ///
+        /// Bit-equivalence with the string path:
+        ///   ToByteArray writes low (LE) into bytes[0..7], high (LE) into bytes[8..15].
+        ///   After Array.Reverse, bytes[0..7] = high (BE), bytes[8..15] = low (BE).
+        ///   Mask of bytes[0] &amp; 0x3F clears the top two bits of high's MSByte, equivalent to
+        ///   `high &amp; 0x3FFFFFFFFFFFFFFF`. Hex-encoding emits high then low; downstream parser
+        ///   reads first 16 chars as high, last 16 as low — round-trip cancels.
+        /// </summary>
+        private UInt128 GetEffectivePartitionKeyHashV2()
+        {
+            UInt128 hash128;
             using (MemoryStream ms = new MemoryStream())
+            using (BinaryWriter binaryWriter = new BinaryWriter(ms))
             {
-                using (BinaryWriter binaryWriter = new BinaryWriter(ms))
+                for (int i = 0; i < this.Components.Count; i++)
                 {
-                    for (int i = 0; i < this.Components.Count; i++)
-                    {
-                        this.Components[i].WriteForHashingV2(binaryWriter);
-                    }
-
-                    UInt128 hash128 = MurmurHash3.Hash128(ms.GetBuffer(), (int)ms.Length, UInt128.MinValue);
-                    hash = UInt128.ToByteArray(hash128);
-                    Array.Reverse(hash);
-
-                    // Reset 2 most significant bits, as max exclusive value is 'FF'.
-                    // Plus one more just in case.
-                    hash[0] &= 0x3F;
+                    this.Components[i].WriteForHashingV2(binaryWriter);
                 }
+
+                hash128 = MurmurHash3.Hash128(ms.GetBuffer(), (int)ms.Length, UInt128.MinValue);
             }
 
-            return HexConvert.ToHex(hash, 0, hash.Length);
+            // Reset 2 most significant bits of the high ulong (post-reverse this is bytes[0]),
+            // matching the existing string path's `hash[0] &= 0x3F`.
+            return UInt128.Create(low: hash128.GetLow(), high: hash128.GetHigh() & 0x3FFFFFFFFFFFFFFFul);
+        }
+
+        /// <summary>
+        /// Tries to compute the effective partition key as a <see cref="UInt128"/> directly,
+        /// bypassing the hex-string allocation entirely. Currently supports the V2 hash hot path
+        /// (<see cref="PartitionKind.Hash"/> + <see cref="PartitionKeyDefinitionVersion.V2"/>).
+        ///
+        /// Returns false (with <paramref name="effectivePartitionKey"/> set to default) for V1 hash,
+        /// MultiHash, range partitioning, and the Empty/Infinity sentinels — callers must fall back
+        /// to <see cref="GetEffectivePartitionKeyString"/> in those cases.
+        /// </summary>
+        public bool TryGetEffectivePartitionKeyV2Hash(PartitionKeyDefinition partitionKeyDefinition, out UInt128 effectivePartitionKey)
+        {
+            effectivePartitionKey = default;
+
+            if (partitionKeyDefinition == null
+                || partitionKeyDefinition.Kind != PartitionKind.Hash
+                || (partitionKeyDefinition.Version ?? PartitionKeyDefinitionVersion.V1) != PartitionKeyDefinitionVersion.V2)
+            {
+                return false;
+            }
+
+            if (this.components == null
+                || this.Equals(EmptyPartitionKey)
+                || this.Equals(InfinityPartitionKey))
+            {
+                return false;
+            }
+
+            // Strict shape match required by V2 hash. Looser variants fall through to string path.
+            if (this.Components.Count != partitionKeyDefinition.Paths.Count)
+            {
+                return false;
+            }
+
+            effectivePartitionKey = this.GetEffectivePartitionKeyHashV2();
+            return true;
+        }
+
+        /// <summary>
+        /// Tries to write the V2 hash effective partition key directly into a caller-owned
+        /// 16-byte big-endian span, with the top two bits of byte[0] cleared. This is the
+        /// allocation-free producer used by the routing fast path: callers pass a
+        /// <c>stackalloc byte[16]</c> and consume the result via <see cref="Routing.EffectivePartitionKey"/>.
+        ///
+        /// Returns false for V1 hash, MultiHash, range, and Empty/Infinity sentinels.
+        /// </summary>
+        public bool TryWriteEffectivePartitionKeyV2HashBytes(PartitionKeyDefinition partitionKeyDefinition, Span<byte> destination)
+        {
+            if (destination.Length < 16)
+            {
+                return false;
+            }
+
+            if (!this.TryGetEffectivePartitionKeyV2Hash(partitionKeyDefinition, out UInt128 numeric))
+            {
+                return false;
+            }
+
+            // Layout: bytes[0..7] = high BE (top-2 bits already masked by producer),
+            //         bytes[8..15] = low BE.
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt64BigEndian(destination, numeric.GetHigh());
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt64BigEndian(destination.Slice(8), numeric.GetLow());
+            return true;
         }
 
         private static byte[] HexStringToByteArray(string hex)
