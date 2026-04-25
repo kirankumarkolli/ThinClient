@@ -38,7 +38,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
         private const string ContainerRid = "ccZ1ANCszwk=";
         private const string TsvPath = "Data/shared_conversations_pkranges.tsv";
         private static readonly string CannedOkDocumentId = MockedItemBenchmarkHelper.ExistingItemId;
-        private const int PkPoolSize = 1024;
+        private const int PkPoolSize = 65536;
         private const int PkSeed = 42;
 
         private CosmosClient client;
@@ -82,26 +82,11 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
             this.client = new CosmosClient(RegionEndpoint + "/", fakeKey, options);
             this.container = this.client.GetContainer(DatabaseName, ContainerName);
 
-            // Pre-warm the address cache: reading each PK once populates the
-            // GatewayAddressCache entry for its resolved PKRange, so the measured
-            // [Benchmark] iteration below does zero gateway HTTP.
-            Task.Run(async () =>
-            {
-                for (int i = 0; i < this.pkPool.Length; i++)
-                {
-                    using ResponseMessage warm = await this.container.ReadItemStreamAsync(
-                        CannedOkDocumentId, new Cosmos.PartitionKey(this.pkPool[i]));
-                    if (warm.StatusCode != System.Net.HttpStatusCode.OK)
-                    {
-                        throw new InvalidOperationException(
-                            $"DirectModeRoutingBenchmark: prewarm read of PK index {i} returned {warm.StatusCode} (harness misconfigured).");
-                    }
-                }
-            }).GetAwaiter().GetResult();
-
-            this.handler.ResetCounters();
-            this.transport.ResetCounters();
-            this.cursor = 0;
+            // Address-cache population is delegated to BenchmarkDotNet's warmup phase:
+            // BDN runs many warmup invocations of [Benchmark] before measurement, which
+            // cycles through the PK pool and populates the GatewayAddressCache for every
+            // resolved PKRange. The measured iterations therefore observe steady-state
+            // routing with no gateway HTTP I/O.
         }
 
         [GlobalCleanup]

@@ -138,7 +138,10 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Data
 
             Random rng = new Random(seed);
             string[] pool = new string[count];
-            byte[] scratch = new byte[16];
+            // 64 raw bytes → 88-char Base64 partition-key strings, large enough to
+            // exercise realistic PK sizes (well past the 16-byte toy values used in
+            // earlier scaffolding) while staying under the 256-byte PK length limit.
+            byte[] scratch = new byte[64];
             for (int i = 0; i < count; i++)
             {
                 rng.NextBytes(scratch);
