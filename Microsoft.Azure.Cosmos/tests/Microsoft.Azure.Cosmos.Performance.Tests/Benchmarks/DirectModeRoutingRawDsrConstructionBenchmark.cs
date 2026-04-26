@@ -28,7 +28,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
     /// so the same sweep script can drive both classes.</para>
     /// </summary>
     [MemoryDiagnoser]
-    [Config(typeof(DirectModeRoutingBenchmarkConfig))]
+    [Config(typeof(RoutingMapConstructionBenchmarkConfig))]
     public class DirectModeRoutingRawDsrConstructionBenchmark
     {
         private const string TsvPath = "Data/shared_conversations_pkranges.tsv";
