@@ -59,10 +59,18 @@ The benchmark `Profile` axis (`[Params]` on `DirectModeRoutingBenchmark` and
 
 ## Scenarios
 
-| Name        | BDN filter                                    | What it measures |
-| ----------- | --------------------------------------------- | ---------------- |
-| `container` | `*DirectModeRoutingBenchmark.ReadItemStream*` | Full `Container.ReadItemStreamAsync` path |
-| `rawdsr`    | `*DirectModeRoutingRawDsrBenchmark*`          | Routing only, raw DSR (no Container plumbing) |
+| Name                  | BDN filter                                              | What it measures |
+| --------------------- | ------------------------------------------------------- | ---------------- |
+| `container`           | `*DirectModeRoutingBenchmark.ReadItemStream*`           | Full `Container.ReadItemStreamAsync` path (lookup latency, alloc-free hot path) |
+| `rawdsr`              | `*DirectModeRoutingRawDsrBenchmark.ReadViaRawDsr*`      | Routing only, raw DSR (no Container plumbing) — lookup latency |
+| `rawdsr-construction` | `*DirectModeRoutingRawDsrConstructionBenchmark*`        | `CollectionRoutingMap` build cost at 17K ranges — **memory** via `[MemoryDiagnoser]` |
+
+The construction scenario is **opt-in**: not run by `bench-pkrange.ps1` default (it's
+the only place memory savings show up; the lookup scenarios are alloc-free for every
+profile). Run it explicitly via `run-pkrange-sweep.ps1 -Scenarios rawdsr-construction`
+and read the BDN summary report (`p<N>-artifacts\…\*-report.md`) for the
+**`Allocated`** column — that is the headline number for "string vs UInt128" memory
+savings (expect ~80% reduction for numeric variants at 17K ranges).
 
 ## Wrapper usage
 
@@ -78,6 +86,10 @@ The benchmark `Profile` axis (`[Params]` on `DirectModeRoutingBenchmark` and
 
 # Container only
 .\scripts\bench-pkrange.ps1 -Scenarios container
+# Memory benchmark (RawDSR routing-map construction @ 17K ranges, 9 profiles)
+# Use BDN's MemoryDiagnoser column in the *-report.md artifact for the headline
+# "Allocated bytes per build" number.
+.\scripts\run-pkrange-sweep.ps1 -Scenarios rawdsr-construction -Passes 1
 
 # Skip rebuild (artifacts already in bin\Release)
 .\scripts\bench-pkrange.ps1 -SkipBuild
