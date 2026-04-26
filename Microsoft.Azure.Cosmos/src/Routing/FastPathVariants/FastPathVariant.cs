@@ -44,6 +44,9 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
 
         /// <summary>UInt128 binary search using the .NET 7+ intrinsic <see cref="System.UInt128"/>. V2-hash only. Available on net8.0+; falls back to <see cref="UInt128"/> on netstandard2.0.</summary>
         SystemUInt128,
+
+        /// <summary>Slim end-state layout: <see cref="UInt128"/>[N+1] boundary array with upper sentinel. Mirrors <c>SlimRoutingMap</c> in the design doc; used to validate lookup-latency parity vs <see cref="UInt128"/>.</summary>
+        Slim,
     }
 
     /// <summary>
@@ -83,6 +86,7 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
                 case "soa": return FastPathVariant.Soa;
                 case "string-soa": return FastPathVariant.StringSoa;
                 case "system-uint128": return FastPathVariant.SystemUInt128;
+                case "slim": return FastPathVariant.Slim;
                 default: return FastPathVariant.UInt128;
             }
         }
