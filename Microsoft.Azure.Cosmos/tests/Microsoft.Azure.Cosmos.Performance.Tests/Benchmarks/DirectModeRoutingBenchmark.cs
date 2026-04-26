@@ -13,7 +13,6 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
     using Microsoft.Azure.Cosmos.Performance.Tests.Data;
     using Microsoft.Azure.Cosmos.Performance.Tests.Mocks;
     using Microsoft.Azure.Cosmos.Routing;
-    using Microsoft.Azure.Cosmos.Routing.FastPathVariants;
     using Microsoft.Azure.Documents;
     /// <summary>
     /// End-to-end Direct-mode point-read benchmark that exercises the real production SDK
@@ -48,27 +47,18 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
         private DirectStubTransport transport;
         private string[] pkPool;
 
-        // Variant selector wired into BDN. Each [Params] value spawns a fresh child process
-        // (separate GlobalSetup / CosmosClient), keeping the comparison clean. Values match
-        // CollectionRoutingMap's COSMOS_PKRANGE_VARIANT env var names.
-        [Params("string", "uint128", "bytespan-seq", "bytespan-hand", "radix1", "radix2", "cache-last")]
-        public string Variant { get; set; }
+        // Drives both the routing strategy and the producer-side string-EPK bypass through
+        // a single named profile. Each [Params] value spawns a fresh child process.
+        [ParamsSource(nameof(Profiles))]
+        public string Profile { get; set; }
+
+        public static IEnumerable<string> Profiles => RoutingBenchmarkProfiles.AllProfiles;
 
         [GlobalSetup]
         public void GlobalSetup()
         {
-            Environment.SetEnvironmentVariable("COSMOS_PKRANGE_VARIANT", this.Variant);
-            FastPathVariantSelector.ActiveVariant = this.Variant switch
-            {
-                "string" => FastPathVariant.String,
-                "uint128" => FastPathVariant.UInt128,
-                "bytespan-seq" => FastPathVariant.BytespanSeq,
-                "bytespan-hand" => FastPathVariant.BytespanHand,
-                "radix1" => FastPathVariant.Radix1,
-                "radix2" => FastPathVariant.Radix2,
-                "cache-last" => FastPathVariant.CacheLast,
-                _ => FastPathVariant.UInt128,
-            };
+            RoutingBenchmarkProfiles.Apply(this.Profile);
+
             // MockRequestHelper's static ctor reads samplepayload.json from CWD;
             // under BenchmarkDotNet the working directory points at the host project, so
             // re-anchor it at the benchmark assembly's output directory before anything

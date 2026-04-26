@@ -4,9 +4,7 @@
 
 namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
 {
-    using System;
     using System.Collections.Generic;
-    using Microsoft.Azure.Cosmos.Routing.FastPathVariants.Internal;
     using Microsoft.Azure.Cosmos.Routing.FastPathVariants.Strategies;
     using Microsoft.Azure.Documents;
 
@@ -27,8 +25,6 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
     /// </remarks>
     internal static class FastPathStrategyFactory
     {
-        internal const string CacheLastInnerEnvironmentVariableName = "AZURE_COSMOS_FASTPATH_CACHELAST_INNER";
-
         /// <summary>
         /// Creates the strategy instance for this routing map. The strategy independently
         /// builds whatever data it needs from <paramref name="orderedRanges"/>; the caller's
@@ -74,47 +70,9 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
                     return new SoaStrategy(orderedRanges);
                 case FastPathVariant.StringSoa:
                     return new StringSoaStrategy(orderedRanges);
-                case FastPathVariant.CacheLast:
-                    return CreateCacheLast(orderedRanges, hasNumericFastPath);
                 default:
                     return new UInt128Strategy(orderedRanges);
             }
-        }
-
-        private static IRoutingFastPathStrategy CreateCacheLast(
-            IReadOnlyList<PartitionKeyRange> orderedRanges,
-            bool hasNumericFastPath)
-        {
-            FastPathVariant innerVariant = FastPathVariantSelector.Parse(
-                Environment.GetEnvironmentVariable(CacheLastInnerEnvironmentVariableName));
-
-            if (innerVariant == FastPathVariant.CacheLast)
-            {
-                // Avoid infinite recursion if someone configures CacheLast → CacheLast.
-                innerVariant = FastPathVariant.UInt128;
-            }
-
-            IRoutingFastPathStrategy inner = Create(innerVariant, orderedRanges, hasNumericFastPath);
-
-            int n = orderedRanges.Count;
-            UInt128[] sortedNumericBoundaries = new UInt128[n];
-            PartitionKeyRange[] payloads = new PartitionKeyRange[n];
-            for (int i = 0; i < n; i++)
-            {
-                PartitionKeyRange range = orderedRanges[i];
-                payloads[i] = range;
-                string min = range.MinInclusive;
-                if (min.Length == 0)
-                {
-                    sortedNumericBoundaries[i] = UInt128.MinValue;
-                }
-                else
-                {
-                    HexCodec.TryParseHex32ToUInt128(min, out sortedNumericBoundaries[i]);
-                }
-            }
-
-            return new CacheLastStrategy(inner, sortedNumericBoundaries, payloads);
         }
     }
 }

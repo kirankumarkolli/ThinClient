@@ -36,9 +36,6 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
         /// <summary>UInt128 + top-16-bit (65536-bucket) radix dispatch then narrow binary search.</summary>
         Radix2,
 
-        /// <summary>Decorator: last-resolved-index cache wrapping another strategy.</summary>
-        CacheLast,
-
         /// <summary>Bytespan + payload SoA + branchless binary search.</summary>
         Soa,
 
@@ -80,7 +77,6 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
                 case "bytespan-hand": return FastPathVariant.BytespanHand;
                 case "radix1": return FastPathVariant.Radix1;
                 case "radix2": return FastPathVariant.Radix2;
-                case "cache-last": return FastPathVariant.CacheLast;
                 case "soa": return FastPathVariant.Soa;
                 case "string-soa": return FastPathVariant.StringSoa;
                 default: return FastPathVariant.UInt128;
