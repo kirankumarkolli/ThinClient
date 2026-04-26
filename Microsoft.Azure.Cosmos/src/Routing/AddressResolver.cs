@@ -19,6 +19,7 @@ namespace Microsoft.Azure.Cosmos
     using Microsoft.Azure.Documents.Rntbd;
     using Microsoft.Azure.Documents.Routing;
     using Newtonsoft.Json;
+    using UInt128 = Microsoft.Azure.Cosmos.UInt128;
 
     /// <summary>
     /// Abstracts out the logic to resolve physical replica addresses for the given <see cref="DocumentServiceRequest"/>.

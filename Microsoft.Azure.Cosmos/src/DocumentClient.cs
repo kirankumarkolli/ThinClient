@@ -1,4 +1,4 @@
-//------------------------------------------------------------
+﻿//------------------------------------------------------------
 // Copyright (c) Microsoft Corporation.  All rights reserved.
 //------------------------------------------------------------
 
@@ -6733,7 +6733,7 @@ namespace Microsoft.Azure.Cosmos
                 {
 #if INTERNAL
                     IsDistributedTracingEnabled = !this.cosmosClientTelemetryOptions.DisableDistributedTracing
-#else
+#elif NETSTANDARD2_0
                     IsDistributedTracingEnabled = false
 #endif
 

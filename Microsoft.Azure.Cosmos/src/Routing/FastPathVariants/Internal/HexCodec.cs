@@ -7,6 +7,7 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants.Internal
     using System;
     using System.Runtime.CompilerServices;
     using Microsoft.Azure.Documents;
+    using UInt128 = Microsoft.Azure.Cosmos.UInt128;
 
     /// <summary>
     /// Zero-allocation helpers for parsing fixed-width 32-character hexadecimal

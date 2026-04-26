@@ -15,6 +15,7 @@ namespace Microsoft.Azure.Cosmos.Routing
     using Microsoft.Azure.Cosmos.Routing.FastPathVariants.Strategies;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Routing;
+    using UInt128 = Microsoft.Azure.Cosmos.UInt128;
 
     /// <summary>
     /// Stored partition key ranges in an efficient way with some additional information and provides

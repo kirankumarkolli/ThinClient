@@ -10,6 +10,7 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants.Strategies
     using Microsoft.Azure.Cosmos.Routing.FastPathVariants.Internal;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Routing;
+    using UInt128 = Microsoft.Azure.Cosmos.UInt128;
 
     /// <summary>
     /// V2-hash-only strategy: branchless binary search over packed byte boundaries +

@@ -7,6 +7,7 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
     using System;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Routing;
+    using UInt128 = Microsoft.Azure.Cosmos.UInt128;
 
     /// <summary>
     /// Contract for a routing-map fast-path lookup strategy.

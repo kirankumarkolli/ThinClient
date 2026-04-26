@@ -1,4 +1,4 @@
-﻿//------------------------------------------------------------
+﻿﻿//------------------------------------------------------------
 // Copyright (c) Microsoft Corporation.  All rights reserved.
 //------------------------------------------------------------
 
@@ -14,6 +14,8 @@ namespace Microsoft.Azure.Documents.Routing
     using Microsoft.Azure.Documents.SharedFiles.Routing;
 
     using Newtonsoft.Json;
+    using Int128 = Microsoft.Azure.Documents.SharedFiles.Routing.Int128;
+    using UInt128 = Microsoft.Azure.Documents.UInt128;
 
     /// <summary>
     /// Schema-less Partition Key value.

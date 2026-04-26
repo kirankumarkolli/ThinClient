@@ -1,4 +1,4 @@
-﻿//------------------------------------------------------------
+﻿﻿//------------------------------------------------------------
 // Copyright (c) Microsoft Corporation.  All rights reserved.
 //------------------------------------------------------------
 
@@ -15,6 +15,7 @@ namespace Microsoft.Azure.Cosmos.Json
     using Microsoft.Azure.Cosmos.Core;
     using Microsoft.Azure.Cosmos.Core.Utf8;
     using static Microsoft.Azure.Cosmos.Json.JsonBinaryEncoding;
+    using UInt128 = Microsoft.Azure.Cosmos.UInt128;
 
     /// <summary>
     /// Partial class for the JsonWriter that has a private JsonTextWriter below.

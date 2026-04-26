@@ -8,6 +8,7 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants.Internal
     using System.Buffers.Binary;
     using System.Runtime.CompilerServices;
     using Microsoft.Azure.Documents;
+    using UInt128 = Microsoft.Azure.Cosmos.UInt128;
 
     /// <summary>
     /// Family of binary searches over a flat byte[] of 16-byte big-endian boundaries,

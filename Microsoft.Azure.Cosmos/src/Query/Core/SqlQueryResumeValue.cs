@@ -1,4 +1,4 @@
-﻿// ------------------------------------------------------------
+﻿﻿// ------------------------------------------------------------
 // Copyright (c) Microsoft Corporation.  All rights reserved.
 // ------------------------------------------------------------
 
@@ -11,6 +11,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.OrderBy;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.Distinct;
     using Newtonsoft.Json;
+    using UInt128 = Microsoft.Azure.Cosmos.UInt128;
 
     // Class that represents the resume value of a query. Primarily used to represent the resume value for order by query
     // The actual value is saved as a CosmosElement. Only native JSON types are supported. C* types are not supported.
