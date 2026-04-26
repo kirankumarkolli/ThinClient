@@ -24,8 +24,9 @@ $dllPath    = Join-Path $projectDir 'bin\Release\net8.0\Microsoft.Azure.Cosmos.P
 if (-not (Test-Path $dllPath)) { throw "Benchmark DLL not found: $dllPath (build with -c Release first)" }
 
 $allScenarios = @(
-    @{ Name = 'rawdsr';    Filter = '*DirectModeRoutingRawDsrBenchmark*' },
-    @{ Name = 'container'; Filter = '*DirectModeRoutingBenchmark.ReadItemStream*' }
+    @{ Name = 'rawdsr';              Filter = '*DirectModeRoutingRawDsrBenchmark.ReadViaRawDsr*' },
+    @{ Name = 'container';           Filter = '*DirectModeRoutingBenchmark.ReadItemStream*' },
+    @{ Name = 'rawdsr-construction'; Filter = '*DirectModeRoutingRawDsrConstructionBenchmark*' }
 )
 $matchedScenarios = @($allScenarios | Where-Object { $Scenarios -contains $_.Name })
 if (-not $matchedScenarios) { throw "No matching scenarios in: $($Scenarios -join ',')" }

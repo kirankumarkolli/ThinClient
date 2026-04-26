@@ -33,6 +33,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
     /// of <see cref="Microsoft.Azure.Cosmos.Routing.AddressResolver"/> — i.e. the path where
     /// the producer-side string-EPK bypass (PR #9 / variant F) actually fires.
     /// </summary>
+    [MemoryDiagnoser]
     [Config(typeof(DirectModeRoutingBenchmarkConfig))]
     public class DirectModeRoutingRawDsrBenchmark
     {
