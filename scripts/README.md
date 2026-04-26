@@ -9,9 +9,15 @@ Tools for reproducing the PKRange-lookup fast-path optimization numbers reported
 .\scripts\bench-pkrange.ps1
 ```
 
-Builds Performance.Tests in Release, runs all 9 fast-path variants × 2 scenarios
-× 3 alternating passes, then prints a percentile table where each cell shows
-`avg [min..max]` across the 3 passes.
+Builds Performance.Tests in Release, runs all 9 fast-path variants × the
+`rawdsr` scenario × 3 alternating passes, then prints a percentile table where
+each cell shows `avg [min..max]` across the 3 passes.
+
+To include the `container` scenario as well, pass `-Scenarios`:
+
+```powershell
+.\scripts\bench-pkrange.ps1 -Scenarios rawdsr,container
+```
 
 ## Files
 
@@ -61,11 +67,17 @@ The benchmark `Profile` axis (`[Params]` on `DirectModeRoutingBenchmark` and
 ## Wrapper usage
 
 ```powershell
-# Full sweep (~45–60 min): 9 variants × 2 scenarios × 3 passes
+# Default sweep: 9 variants × rawdsr × 3 passes
 .\scripts\bench-pkrange.ps1
 
-# Smoke run (~5–8 min): 9 variants × container only × 1 pass
+# Smoke run: 9 variants × rawdsr × 1 pass
 .\scripts\bench-pkrange.ps1 -Quick
+
+# Include container scenario alongside rawdsr
+.\scripts\bench-pkrange.ps1 -Scenarios rawdsr,container
+
+# Container only
+.\scripts\bench-pkrange.ps1 -Scenarios container
 
 # Skip rebuild (artifacts already in bin\Release)
 .\scripts\bench-pkrange.ps1 -SkipBuild
@@ -76,10 +88,14 @@ The benchmark `Profile` axis (`[Params]` on `DirectModeRoutingBenchmark` and
 
 Parameters:
 
-- `-RepoRoot <path>` — auto-detected from `$PSScriptRoot`.
-- `-OutDir <path>`   — defaults to `<repo>\bench-out\pkrange`.
-- `-SkipBuild`       — skip `dotnet build`; assumes DLL exists.
-- `-Quick`           — 1 pass, container scenario only.
+- `-RepoRoot <path>`     — auto-detected from `$PSScriptRoot`.
+- `-OutDir <path>`       — defaults to `<repo>\bench-out\pkrange`.
+- `-SkipBuild`           — skip `dotnet build`; assumes DLL exists.
+- `-Quick`               — 1 pass instead of 3 (uses the same `-Scenarios` set).
+- `-Scenarios <names>`   — scenarios to run; defaults to `@('rawdsr')`. Valid: `rawdsr`, `container`.
+
+`run-pkrange-sweep.ps1` accepts the same `-Scenarios` parameter directly when
+you don't need the build/aggregation wrapper.
 
 ## Output layout
 
