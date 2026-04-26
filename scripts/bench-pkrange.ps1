@@ -5,8 +5,9 @@
 # so a single command produces the markdown table for the optimization report.
 #
 # Usage:
-#   .\scripts\bench-pkrange.ps1                       # full sweep (10 variants × 2 scenarios × 3 passes)
-#   .\scripts\bench-pkrange.ps1 -Quick                # 1 pass, container only
+#   .\scripts\bench-pkrange.ps1                                 # full sweep (rawdsr only, 3 passes)
+#   .\scripts\bench-pkrange.ps1 -Quick                          # 1 pass, rawdsr only
+#   .\scripts\bench-pkrange.ps1 -Scenarios rawdsr,container     # include container scenario
 #   .\scripts\bench-pkrange.ps1 -SkipBuild -OutDir D:\bench
 
 [CmdletBinding()]
@@ -14,7 +15,8 @@ param(
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
     [string]$OutDir   = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'bench-out\pkrange'),
     [switch]$SkipBuild,
-    [switch]$Quick
+    [switch]$Quick,
+    [string[]]$Scenarios = @('rawdsr')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,7 +35,7 @@ if (-not (Test-Path $dllPath)) { throw "Benchmark DLL not found: $dllPath" }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 $passes    = if ($Quick) { 1 } else { 3 }
-$scenarios = if ($Quick) { @('container') } else { @('rawdsr', 'container') }
+$scenarios = $Scenarios
 
 Write-Host "==> Running sweep ($passes pass(es), scenarios: $($scenarios -join ', '))" -ForegroundColor Cyan
 & (Join-Path $PSScriptRoot 'run-pkrange-sweep.ps1') -RepoRoot $RepoRoot -OutDir $OutDir -Passes $passes -Scenarios $scenarios
