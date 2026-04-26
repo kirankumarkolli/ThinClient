@@ -9,6 +9,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
     using System.Linq;
     using BenchmarkDotNet.Attributes;
     using Microsoft.Azure.Cosmos.Performance.Tests.Data;
+    using Microsoft.Azure.Cosmos.Performance.Tests.Slim;
     using Microsoft.Azure.Cosmos.Routing;
     using Microsoft.Azure.Documents;
 
@@ -34,6 +35,9 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
         private const string TsvPath = "Data/shared_conversations_pkranges.tsv";
 
         private Tuple<PartitionKeyRange, ServiceIdentity>[] tuples;
+        private GatewayRangeRow[] slimRows;
+        private byte[] gatewayJsonUtf8;
+        private int slimRowCount;
 
         [ParamsSource(nameof(Profiles))]
         public string Profile { get; set; }
@@ -56,6 +60,17 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
             this.tuples = ranges
                 .Select(r => Tuple.Create(r, (ServiceIdentity)null))
                 .ToArray();
+
+            // Spike: slim-map inputs. Both buffers are amortized in setup so per-op
+            // memory diagnostics reflect only the build path, matching how `tuples`
+            // is amortized for the existing BuildRoutingMap measurement above.
+            this.slimRows = ranges
+                .Select(r => GatewayRangeRow.From(r.Id, r.MinInclusive, r.MaxExclusive))
+                .ToArray();
+            this.slimRowCount = ranges.Count;
+            this.gatewayJsonUtf8 = PkRangeRoutingFactory.SerializePkRangeFeedJson(
+                ranges,
+                containerResourceId: "ccZ1ANCszwkDAAAAAAAAUA==");
         }
 
         /// <summary>
@@ -70,6 +85,31 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
                 this.tuples,
                 string.Empty,
                 useLengthAwareRangeComparer: false);
+        }
+
+        /// <summary>
+        /// Spike: build a slim numeric-only routing map from pre-parsed
+        /// <see cref="GatewayRangeRow"/> rows. Apples-to-apples with
+        /// <see cref="BuildRoutingMap"/>: both accept setup-amortized input.
+        /// Expected ~430 KB vs 2.22 MB baseline (5×).
+        /// </summary>
+        [Benchmark]
+        public object BuildSlimRoutingMap()
+        {
+            return SlimRoutingMapBuilder.Build(this.slimRows);
+        }
+
+        /// <summary>
+        /// Spike: build a slim numeric-only routing map directly from the
+        /// gateway JSON byte buffer, skipping intermediate
+        /// <see cref="PartitionKeyRange"/> materialization. Proves the
+        /// deserialization-seam saving claimed in §3 of the design doc.
+        /// Expected ~220 KB (10×) vs 2.22 MB baseline.
+        /// </summary>
+        [Benchmark]
+        public object BuildSlimRoutingMapFromJson()
+        {
+            return SlimRoutingMapBuilder.BuildFromJson(this.gatewayJsonUtf8, this.slimRowCount);
         }
     }
 }
