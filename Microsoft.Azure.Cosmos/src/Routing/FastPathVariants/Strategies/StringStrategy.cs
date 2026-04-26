@@ -9,6 +9,7 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants.Strategies
     using System.Diagnostics;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Routing;
+    using UInt128 = Microsoft.Azure.Cosmos.UInt128;
 
     /// <summary>
     /// Production baseline strategy: ordinal <see cref="Array.BinarySearch{T}(T[], T, IComparer{T})"/>

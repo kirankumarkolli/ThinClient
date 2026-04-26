@@ -7,6 +7,7 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
     using System.Collections.Generic;
     using Microsoft.Azure.Cosmos.Routing.FastPathVariants.Strategies;
     using Microsoft.Azure.Documents;
+    using UInt128 = Microsoft.Azure.Cosmos.UInt128;
 
     /// <summary>
     /// Builds a single <see cref="IRoutingFastPathStrategy"/> for a routing-map instance,

@@ -1,4 +1,4 @@
-﻿// ------------------------------------------------------------
+﻿﻿// ------------------------------------------------------------
 // Copyright (c) Microsoft Corporation.  All rights reserved.
 // ------------------------------------------------------------
 
@@ -9,6 +9,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.Distinct
     using Microsoft.Azure.Cosmos.Core.Utf8;
     using Microsoft.Azure.Cosmos.CosmosElements;
     using Microsoft.Azure.Cosmos.CosmosElements.Numbers;
+    using UInt128 = Microsoft.Azure.Cosmos.UInt128;
 
     internal static class DistinctHash
     {

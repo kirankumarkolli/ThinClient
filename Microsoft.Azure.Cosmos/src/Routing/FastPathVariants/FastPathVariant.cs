@@ -1,4 +1,4 @@
-//------------------------------------------------------------
+﻿//------------------------------------------------------------
 // Copyright (c) Microsoft Corporation.  All rights reserved.
 //------------------------------------------------------------
 
@@ -41,6 +41,9 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
 
         /// <summary>String binary search + payload SoA + branchless string binary search. Works on any topology (V1/V2/hierarchical).</summary>
         StringSoa,
+
+        /// <summary>UInt128 binary search using the .NET 7+ intrinsic <see cref="System.UInt128"/>. V2-hash only. Available on net8.0+; falls back to <see cref="UInt128"/> on netstandard2.0.</summary>
+        SystemUInt128,
     }
 
     /// <summary>
@@ -79,6 +82,7 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
                 case "radix2": return FastPathVariant.Radix2;
                 case "soa": return FastPathVariant.Soa;
                 case "string-soa": return FastPathVariant.StringSoa;
+                case "system-uint128": return FastPathVariant.SystemUInt128;
                 default: return FastPathVariant.UInt128;
             }
         }

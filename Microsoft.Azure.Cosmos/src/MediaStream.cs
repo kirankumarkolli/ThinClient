@@ -131,7 +131,7 @@ namespace Microsoft.Azure.Cosmos
         }
 #endif
 
-#if !(NETSTANDARD16 || NETSTANDARD20)
+#if !(NETSTANDARD16 || NETSTANDARD20 || NET)
         public override System.Runtime.Remoting.ObjRef CreateObjRef(Type requestedType)
         {
             return this.contentStream.CreateObjRef(requestedType);
