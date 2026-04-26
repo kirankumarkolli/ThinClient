@@ -81,6 +81,10 @@ savings (expect ~80% reduction for numeric variants at 17K ranges).
 # Smoke run: 9 variants × rawdsr × 1 pass
 .\scripts\bench-pkrange.ps1 -Quick
 
+# Smoke mode: ~2-minute script-validation run (1000 invocations × 3 iterations,
+# 1 pass, no aggregation). NOT for honest perf comparisons.
+.\scripts\bench-pkrange.ps1 -Smoke
+
 # Include container scenario alongside rawdsr
 .\scripts\bench-pkrange.ps1 -Scenarios rawdsr,container
 
@@ -101,10 +105,11 @@ savings (expect ~80% reduction for numeric variants at 17K ranges).
 Parameters:
 
 - `-RepoRoot <path>`     — auto-detected from `$PSScriptRoot`.
-- `-OutDir <path>`       — defaults to `<repo>\bench-out\pkrange`.
+- `-OutDir <path>`       — defaults to `<repo>\bench-out\pkrange\<run-|smoke->yyyy-MM-dd_HHmmss\` (each invocation gets its own timestamped folder so successive runs don't overwrite). Pin a specific path when feeding the aggregator manually.
 - `-SkipBuild`           — skip `dotnet build`; assumes DLL exists.
 - `-Quick`               — 1 pass instead of 3 (uses the same `-Scenarios` set).
-- `-Scenarios <names>`   — scenarios to run; defaults to `@('rawdsr')`. Valid: `rawdsr`, `container`.
+- `-Smoke`               — fast script-validation run: passes `--invocationCount 1000 --warmupCount 2 --iterationCount 3` to BDN, forces 1 pass, and skips percentile aggregation. Whole sweep finishes in ~2 minutes. Results have very wide error bars; use for plumbing validation only.
+- `-Scenarios <names>`   — scenarios to run; defaults to `@('rawdsr')`. Valid: `rawdsr`, `container`, `rawdsr-construction`.
 
 `run-pkrange-sweep.ps1` accepts the same `-Scenarios` parameter directly when
 you don't need the build/aggregation wrapper.

@@ -13,7 +13,15 @@ param(
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
     [string]$OutDir   = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'bench-out\pkrange'),
     [int]$Passes      = 3,
-    [string[]]$Scenarios = @('rawdsr')
+    [string[]]$Scenarios = @('rawdsr'),
+    # Smoke mode: forces BDN to run a tiny, fast configuration (overrides the
+    # class-level [Config] InvocationCount). Useful for validating script flow
+    # in ~2 minutes; NOT for honest perf comparisons (results have very wide
+    # error bars and are dominated by noise).
+    [switch]$Smoke,
+    [int]$InvocationCount = 1000,
+    [int]$WarmupCount     = 2,
+    [int]$IterationCount  = 3
 )
 
 $ErrorActionPreference = 'Continue'
@@ -47,7 +55,15 @@ foreach ($scenario in $matchedScenarios) {
 
         # BDN spawns one child process per [Params] value (each profile),
         # cycling them in alpha order — alternation is preserved across passes.
-        & dotnet $dllPath --filter $($scenario.Filter) --artifacts $artifactsDir 2>&1 |
+        $bdnArgs = @('--filter', $scenario.Filter, '--artifacts', $artifactsDir)
+        if ($Smoke) {
+            $bdnArgs += @(
+                '--invocationCount', $InvocationCount,
+                '--warmupCount',     $WarmupCount,
+                '--iterationCount',  $IterationCount
+            )
+        }
+        & dotnet $dllPath @bdnArgs 2>&1 |
             Tee-Object -FilePath $logFile | Out-Null
 
         # Consolidated measurements CSV: one row per (profile, iteration).
