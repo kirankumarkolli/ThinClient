@@ -13,7 +13,7 @@ param(
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
     [string]$OutDir   = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'bench-out\pkrange'),
     [int]$Passes      = 3,
-    [string[]]$Scenarios = @('rawdsr', 'container')
+    [string[]]$Scenarios = @('rawdsr')
 )
 
 $ErrorActionPreference = 'Continue'
