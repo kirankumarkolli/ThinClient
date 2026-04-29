@@ -34,6 +34,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
             "soa",
             "string-soa",
             "system-uint128",
+            "slim",
         };
 
         /// <summary>Resolves a profile token to (variant, bypass) and applies it
@@ -52,6 +53,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests.Benchmarks
                 "soa"                  => (FastPathVariant.Soa,           true),
                 "string-soa"           => (FastPathVariant.StringSoa,     false),
                 "system-uint128"       => (FastPathVariant.SystemUInt128, true),
+                "slim"                 => (FastPathVariant.Slim,          true),
                 _ => throw new ArgumentException(
                         $"Unknown routing benchmark profile '{profile}'. Valid values: " +
                         string.Join(", ", AllProfiles), nameof(profile)),

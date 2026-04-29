@@ -71,6 +71,8 @@ namespace Microsoft.Azure.Cosmos.Routing.FastPathVariants
                     return new SoaStrategy(orderedRanges);
                 case FastPathVariant.StringSoa:
                     return new StringSoaStrategy(orderedRanges);
+                case FastPathVariant.Slim:
+                    return new SlimStrategy(orderedRanges);
                 default:
                     return new UInt128Strategy(orderedRanges);
             }
